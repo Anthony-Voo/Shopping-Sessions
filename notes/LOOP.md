@@ -216,3 +216,4 @@ Note: docker works here (start dockerd; base images from local shopping-sessions
 | G33 | AES-NI id hash (aesenc rounds) instead of the 128-bit multiply chain, everywhere | 63.6-68.3 ns/line | 68.2-73.0 | not faster: reverted (exact: SELFTEST, gate, seeds 215-216) |
 
 USER DIRECTION (Nov 21 ~16:00 UTC): stop creating new designs/experiments; keep refining the current best code (v54 = main; dev v56 = v54 + exact ties) with small incremental edits, keep only confirmed improvements, fewer tests.
+| R1 | refine best: parser PF_DIST 1024/2048/4096/8192 (PARSESTAGE, 3 rounds) | 2048: 64-76 ns | 1024: 66-68, 4096: 63-72, 8192: 63-68 | flat: unchanged |
