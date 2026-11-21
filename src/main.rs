@@ -732,6 +732,204 @@ fn parse_event_chunk3(
     }
     (pay, keys, kcount)
 }
+/// Cache-blocked two-stage event parser: each ~64 KB window (cut at a line end) is indexed and
+/// then parsed while it is still in L2, so the input is read from memory once. Same records as
+/// parse_event_chunk (checked by SELFTEST).
+#[inline(never)]
+fn parse_event_chunk4(
+    chunk: &'static [u8],
+    ci: usize,
+    ws: i64,
+    we: i64,
+    products: &FxHashMap<B, u32>,
+) -> (Vec<PEv>, Vec<DKey>, Vec<u32>) {
+    const NL: u32 = 1 << 31;
+    const WIN: usize = 64 << 10;
+    let n = chunk.len();
+    assert!(n < (1 << 31), "chunk too large for the structural index");
+    let cap = n / 64 + 16;
+    let mut pay: Vec<PEv> = Vec::with_capacity(cap);
+    let mut keys: Vec<DKey> = Vec::with_capacity(cap);
+    let mut kcount = vec![0u32; NSH];
+    // a window never holds more separators than bytes: size the index once
+    let mut idx: Vec<u32> = Vec::with_capacity(WIN + 1024);
+    let mut nlq: Vec<u32> = Vec::with_capacity(WIN + 1024);
+    let mut cm = [0usize; 8];
+    let mut mc = MonthCache::new();
+    let mut pad = [0u8; 64];
+    let mut wstart = 0usize;
+    while wstart < n {
+        // window [wstart, wend): ends just after a newline (or at the chunk end)
+        let wend = if wstart + WIN >= n {
+            n
+        } else {
+            match memchr::memchr(b'\n', &chunk[wstart + WIN..]) {
+                Some(k) => wstart + WIN + k + 1,
+                None => n,
+            }
+        };
+        let wlen = wend - wstart;
+        if idx.capacity() < wlen + 64 {
+            idx.reserve(wlen + 64 - idx.len());
+            nlq.reserve(wlen + 64 - nlq.len());
+        }
+        idx.clear();
+        nlq.clear();
+        // stage 1 on the window (absolute positions)
+        let ip = idx.as_mut_ptr();
+        let mut w = 0usize;
+        let mut qprefix = 0u32;
+        let mut base = wstart;
+        while base < wend {
+            let blk: &[u8] = if base + 64 <= wend {
+                &chunk[base..base + 64]
+            } else {
+                pad = [0u8; 64];
+                pad[..wend - base].copy_from_slice(&chunk[base..wend]);
+                &pad
+            };
+            let (c, nl, q) = block_masks(blk);
+            let mut m = c | nl;
+            while m != 0 {
+                let b = m.trailing_zeros();
+                m &= m - 1;
+                let tag = (((nl >> b) & 1) as u32) << 31;
+                // SAFETY: at most wlen entries (one per byte) and capacity >= wlen + 64
+                unsafe { ip.add(w).write((base as u32 + b) | tag) };
+                w += 1;
+            }
+            let mut mm = nl;
+            while mm != 0 {
+                let b = mm.trailing_zeros();
+                mm &= mm - 1;
+                nlq.push(qprefix + (q & ((1u64 << b) - 1)).count_ones());
+            }
+            qprefix += q.count_ones();
+            base += 64;
+        }
+        // SAFETY: exactly w entries were written
+        unsafe { idx.set_len(w) };
+        let qtotal = qprefix;
+        // stage 2 on the window's lines
+        let m = idx.len();
+        let mut e = 0usize;
+        let mut li = 0usize;
+        let mut next_start = wstart;
+        while next_start < wend {
+            let line_start = next_start;
+            let end;
+            let ok;
+            if e + 7 <= m
+                && idx[e + 6] & NL != 0
+                && (idx[e] | idx[e + 1] | idx[e + 2] | idx[e + 3] | idx[e + 4] | idx[e + 5]) & NL == 0
+            {
+                for k in 0..6 {
+                    cm[k] = idx[e + k] as usize;
+                }
+                end = (idx[e + 6] & !NL) as usize;
+                e += 7;
+                ok = true;
+            } else {
+                let mut k = 0usize;
+                let mut found = None;
+                while e < m {
+                    let v = idx[e];
+                    e += 1;
+                    if v & NL != 0 {
+                        found = Some((v & !NL) as usize);
+                        break;
+                    }
+                    if k < 8 {
+                        cm[k] = v as usize;
+                    }
+                    k += 1;
+                }
+                end = found.unwrap_or(wend);
+                ok = k == 6;
+            }
+            let before = if li == 0 { 0 } else { nlq[li - 1] };
+            let nq = if end < wend { nlq[li] - before } else { qtotal - before };
+            if end < wend {
+                li += 1;
+            }
+            next_start = end + 1;
+            if !ok {
+                continue;
+            }
+        // field k spans [fs_k, fe_k); strip quotes around whole fields; validate the quote count
+            let mut fb = [(0usize, 0usize); 7];
+            let mut pairs = 0u32;
+            let mut fs = line_start;
+            for k in 0..7 {
+                let fe = if k < 6 { cm[k] } else { end };
+                let flen = fe - fs;
+                let first = *chunk.get(fs).unwrap_or(&0);
+                let last = *chunk.get(fe.wrapping_sub(1).max(fs)).unwrap_or(&0);
+                let isq = ((nq > 0) & (flen >= 2) & (first == b'"') & (last == b'"')) as usize;
+                pairs += isq as u32;
+                fb[k] = (fs + isq, fe - isq);
+                fs = fe + 1;
+            }
+            if nq != 2 * pairs {
+                continue; // a quote that is not around a whole field
+            }
+            let field = |k: usize| -> Option<B> {
+                let (a, b) = fb[k];
+                if a < b { Some(&chunk[a..b]) } else { None }
+            };
+            let Some(eid) = field(0) else { continue };
+            let ing = mc.f1(field(3));
+            let ts = parse_ts_over(field(2));
+            let uid = field(1);
+            let kind = event_kind(field(4));
+            let pid = field(5);
+            let mut ok = uid.is_some() && pid.is_some() && kind < 3 && ts != BAD && ts >= ws && ts < we;
+            let mut p = 0u32;
+            let mut cat = 0u16;
+            if ok && kind == 2 {
+                match parse_price(field(6)) {
+                    Some(v) => {
+                        p = v as u32;
+                        cat = match products.get(pid.unwrap()) {
+                            Some(&c) => c as u16,
+                            None => u16::MAX,
+                        };
+                    }
+                    None => ok = false,
+                }
+            }
+            if ok && ing - ts > DAY {
+                ok = false;
+            }
+            let mut idx = u32::MAX as u64;
+            let mut ush = 0u64;
+            if ok {
+                let u = uid.unwrap();
+                idx = pay.len() as u64;
+                let (uh, uh2) = h12_over(u);
+                ush = shard_h(uh) as u64;
+                assert!(u.len() <= 0xFFFF && (u.as_ptr() as u64) < (1 << 48), "user_id reference does not pack");
+                pay.push(PEv {
+                    pk: uh,
+                    nref: (u.as_ptr() as u64) | ((u.len() as u64) << 48),
+                    pk2: uh2 as u32,
+                    ts: (ts - ws) as u32,
+                    price: p,
+                    cat,
+                });
+            }
+            let (eh, eh2) = h12_over(eid);
+            kcount[shard_h(eh)] += 1;
+            // ingest_ts is always F1 (whole seconds); +-68 years around the window fits in i32
+            let ing_s = (ing.div_euclid(1000) - ws.div_euclid(1000)).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            keys.push(DKey { eh, eh2: eh2 as u32, ing: ing_s, loc: (ush << 48) | ((ci as u64) << 32) | idx });
+        }
+        let _ = pad;
+        wstart = wend;
+    }
+    (pay, keys, kcount)
+}
+
 
 
 /// Split a line into exactly N fields; None if malformed. One pass over the bytes.
@@ -1724,6 +1922,13 @@ last,b,c,d,e,f,g"#
                 let c: &'static [u8] = &c[..cut];
                 let (a1, b1, k1) = parse_event_chunk(c, ci, ws, we, &prods);
                 let (a3, b3, k3) = parse_event_chunk3(c, ci, ws, we, &prods);
+                let (a4, b4, k4) = parse_event_chunk4(c, ci, ws, we, &prods);
+                assert!(
+                    a4.len() == a3.len() && b4.len() == b3.len() && k4 == k3
+                        && a4.iter().zip(&a3).all(|(x, y)| x.pk == y.pk && x.nref == y.nref && x.pk2 == y.pk2 && x.ts == y.ts && x.price == y.price && x.cat == y.cat)
+                        && b4.iter().zip(&b3).all(|(x, y)| x.eh == y.eh && x.eh2 == y.eh2 && x.ing == y.ing && x.loc == y.loc),
+                    "parse_event_chunk4 differs on chunk {ci} cut {cut}"
+                );
                 let same = a1.len() == a3.len()
                     && b1.len() == b3.len()
                     && k1 == k3
@@ -1805,10 +2010,9 @@ last,b,c,d,e,f,g"#
     let per_chunk: Vec<(Vec<UEv>, Vec<DKey>, Vec<u32>)> = ev_chunks
         .par_iter()
         .enumerate()
-        .map(|(ci, &c)| parse_event_chunk3(c, ci, ws, we, &products))
+        .map(|(ci, &c)| parse_event_chunk4(c, ci, ws, we, &products))
         .collect();
     lap("  parse lines");
-    eprintln!("   (stage-1 structural index: {:.3}s cpu)", STAGE1_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9);
     let mut pays: Vec<Vec<UEv>> = Vec::with_capacity(per_chunk.len());
     let mut keys: Vec<Vec<DKey>> = Vec::with_capacity(per_chunk.len());
     let mut kcounts: Vec<Vec<u32>> = Vec::with_capacity(per_chunk.len());
@@ -2144,7 +2348,11 @@ last,b,c,d,e,f,g"#
                 cpos[l] += 1;
             }
             let mut cats: Vec<(u32, i64)> = vec![];
-            let mut active: Vec<(u32, u32)> = Vec::new(); // (campaign, clicks in window)
+            // campaigns with clicks in the 7-day window: per-campaign counters + dense list with
+            // positions, so add / expire / iterate are O(1) per click
+            let mut acnt: Vec<u32> = vec![0; ncamp];
+            let mut apos: Vec<u32> = vec![0; ncamp];
+            let mut alist: Vec<u32> = Vec::new();
             for p in 0..np {
                 if eoff[p] == eoff[p + 1] {
                     continue; // no events: this person has no sessions
@@ -2163,7 +2371,10 @@ last,b,c,d,e,f,g"#
                 let cts = |x: &CR| cbase + (x.key & 0xFFFF_FFFF) as i64;
                 // sliding window [lo, hi) over this person's clicks
                 let (mut lo, mut hi) = (0usize, 0usize);
-                active.clear();
+                for &c in &alist {
+                    acnt[c as usize] = 0;
+                }
+                alist.clear();
                 let mut cur_day = i32::MIN;
                 let mut row: Option<URow> = None;
                 let mut k = i;
@@ -2208,19 +2419,23 @@ last,b,c,d,e,f,g"#
                     }
                     // attribution window: start - WEEK <= click.ts <= start
                     while hi < pcl.len() && cts(&pcl[hi]) <= start {
-                        let c = pcl[hi].camp;
-                        match active.iter_mut().find(|x| x.0 == c) {
-                            Some(x) => x.1 += 1,
-                            None => active.push((c, 1)),
+                        let c = pcl[hi].camp as usize;
+                        if acnt[c] == 0 {
+                            apos[c] = alist.len() as u32;
+                            alist.push(c as u32);
                         }
+                        acnt[c] += 1;
                         hi += 1;
                     }
                     while lo < hi && cts(&pcl[lo]) < start - WEEK {
-                        let c = pcl[lo].camp;
-                        let k = active.iter().position(|x| x.0 == c).unwrap();
-                        active[k].1 -= 1;
-                        if active[k].1 == 0 {
-                            active.swap_remove(k);
+                        let c = pcl[lo].camp as usize;
+                        acnt[c] -= 1;
+                        if acnt[c] == 0 {
+                            let k = apos[c] as usize;
+                            let last = *alist.last().unwrap();
+                            alist[k] = last;
+                            apos[last as usize] = k as u32;
+                            alist.pop();
                         }
                         lo += 1;
                     }
@@ -2229,7 +2444,7 @@ last,b,c,d,e,f,g"#
                     a[0] += 1;
                     a[1] += purch as i64;
                     a[2] += rev;
-                    for &(c, _) in &active {
+                    for &c in &alist {
                         camp[cidx(c, day)][3] += 1;
                     }
                     k = e;
