@@ -163,3 +163,10 @@ Stage walls (warm, 4T): parse 0.51, key tail 0.08, dedup 0.07, user shuffle 0.05
 | G4 | lazy assisted counting (flush per window exit / day change) | sess 0.233, median 1.340 (16) | 0.228, 1.293 (10/16) | near-tie, exact (gate + seed 180); KEPT IN STACK (main.g4lazy.rs), evaluate with next ideas |
 | G8 | sessionize radix 2 passes on ts>>9 + per-person insertion fix | sess 0.236 (vs G4) | 0.225, total flat 10/16 | exact (gate + seed 181), in stack |
 | v52 | stack G4 + G8 vs v51 | median 1.337 (24 runs), sess 0.234 | 1.298 (20/24), sess 0.225 | kept, checkpoint on dev (-2.9%, below the 5% bar for main) |
+| G9 | regroup split: resolve 0.10 s, person partition 0.03 s. Flat open-addressing resolve table (retry of v27) | regroup 0.146, total 1.310 (16) | 0.191, 1.360 (2/16) | worse, reverted (main.g9rt.rs) |
+| G10 | campaign lookup by number (array) when all ids are canonical c_<n> | clicks stage 0.165, total 1.288 (16) | 0.176, 1.304 (8/16) | tie, reverted (main.g10camp.rs, exact: gate + seed 183) |
+
+Observation (Nov 21 ~14:00): micro-level CPU cuts (sliding masks, ts cache, campaign array, flat resolve table) all tie or lose;
+byte cuts (P1 20 B keys, H2 26 B PEv) also tied alone but won when stacked. Remaining wins come from stacking exact near-ties.
+Ideas next: G11 PR/PEv price+cat in one u32 when ncat < 255 (fallback: current layout via const generic) ; G12 dedup key 20 B (P1) restacked on v52 ;
+G13 sessionize: skip the click radix entirely for persons with 0/1 clicks (most), sort clicks per person only when >1 ; G14 write stage overlap with sessionize.
