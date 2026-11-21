@@ -6,9 +6,10 @@ COPY src ./src
 COPY .cargo ./.cargo
 COPY vendor ./vendor
 COPY pgo ./pgo
-# Target the scorer's Cascade Lake+ CPUs; profile-guided optimization from pgo/merged.profdata
+# Target the scorer's Cascade Lake+ CPUs; non-PIE (static relocation model, absolute addresses);
+# profile-guided optimization from pgo/merged.profdata
 # (made with notes/pgo.sh by the same rustc 1.90 from this source on generator data).
-ENV RUSTFLAGS="-C target-cpu=cascadelake -Cprofile-use=/src/pgo/merged.profdata"
+ENV RUSTFLAGS="-C target-cpu=cascadelake -C relocation-model=static -Cprofile-use=/src/pgo/merged.profdata"
 RUN cargo build --release --locked --offline && strip target/release/sessions
 
 FROM debian:bookworm-slim

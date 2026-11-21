@@ -5,7 +5,7 @@ set -e
 cd /home/user/shopping-sessions
 S=/tmp/claude-0/-home-user/7093f2af-7756-5848-9566-55372d396f64/scratchpad
 RAW=/tmp/claude-0/pgo-raw; rm -rf $RAW; mkdir -p $RAW
-RUSTFLAGS="-C target-cpu=cascadelake -Cprofile-generate=$RAW" cargo +1.90 build --release --locked --offline --target-dir $S/tpgo-gen 2>&1 | tail -1
+RUSTFLAGS="-C target-cpu=cascadelake -C relocation-model=static -Cprofile-generate=$RAW" cargo +1.90 build --release --locked --offline --target-dir $S/tpgo-gen 2>&1 | tail -1
 export GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432:glibc.malloc.trim_threshold=17179869184
 cd $S/ws
 for i in 1 2; do rm -rf out/pg; $S/tpgo-gen/release/sessions data/p20m out/pg >/dev/null 2>&1; done
