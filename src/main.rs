@@ -966,6 +966,8 @@ fn parse_event_chunk5(
         }
         let mut k = 0usize;
         let mut nq = 0u32;
+        // fast path only: line-relative comma and quote masks and the newline offset
+        let mut fastm: Option<(u128, u128, u32)> = None;
         let mut off = line_start;
         let end;
         // fast path: the whole line (and its newline) within the next 128 bytes
@@ -984,6 +986,7 @@ fn parse_event_chunk5(
                     continue;
                 }
                 nq = q128.count_ones();
+                fastm = Some((cm128, q128, e));
                 let mut m = cm128;
                 for slot in cm.iter_mut().take(6) {
                     *slot = line_start + m.trailing_zeros() as usize;
@@ -1041,6 +1044,23 @@ fn parse_event_chunk5(
             let mut fb = [(0usize, 0usize); 7];
             let mut pairs = 0u32;
             let mut fs = line_start;
+            if let Some((cm128, q128, e)) = fastm {
+                // all 7 fields at once from the masks (same rule as the loop below): field k is
+                // quoted iff its first and last characters are quotes and it is >= 2 long
+                let starts = 1u128 | (cm128 << 1); // first character of each field
+                let seps = cm128 | (1u128 << e); // the separator after each field
+                let qs = pext128(q128, starts); // bit k: field k starts with a quote
+                let qe = pext128(q128 << 1, seps); // bit k: field k ends with a quote
+                let one = pext128((starts << 1) & seps, seps); // bit k: field k is 1 long
+                let qb = (qs & qe & !one) as u32 & 0x7F;
+                pairs = qb.count_ones();
+                for k in 0..7 {
+                    let fe = if k < 6 { cm[k] } else { end };
+                    let isq = ((qb >> k) & 1) as usize;
+                    fb[k] = (fs + isq, fe - isq);
+                    fs = fe + 1;
+                }
+            } else {
             for k in 0..7 {
                 let fe = if k < 6 { cm[k] } else { end };
                 let flen = fe - fs;
@@ -1050,6 +1070,7 @@ fn parse_event_chunk5(
                 pairs += isq as u32;
                 fb[k] = (fs + isq, fe - isq);
                 fs = fe + 1;
+            }
             }
             if nq != 2 * pairs {
                 continue; // a quote that is not around a whole field
@@ -1081,6 +1102,216 @@ fn parse_event_chunk5(
             }
             if ok && ing - ts > DAY {
                 ok = false;
+            }
+            let mut idx = u32::MAX as u64;
+            let mut ush = 0u64;
+            if ok {
+                let u = uid.unwrap();
+                idx = pay.len() as u64;
+                let (uh, uh2) = h12_over(u);
+                ush = shard_h(uh) as u64;
+                ucount[ush as usize] += 1;
+                assert!(u.len() <= 0xFFFF && (u.as_ptr() as u64) < (1 << 48), "user_id reference does not pack");
+                pay.push(PEv {
+                    pk: uh,
+                    nref: (u.as_ptr() as u64) | ((u.len() as u64) << 48),
+                    pk2: uh2 as u32,
+                    ts: (ts - ws) as u32,
+                    price: p,
+                    cat,
+                });
+            }
+            let (eh, eh2) = h12_over(eid);
+            kcount[shard_h(eh)] += 1;
+            // ingest_ts is always F1 (whole seconds); +-68 years around the window fits in i32
+            let ing_s = (ing.div_euclid(1000) - ws.div_euclid(1000)).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            keys.push(DKey { eh, eh2: eh2 as u32, ing: ing_s, loc: (ush << 48) | ((ci as u64) << 32) | idx });
+    }
+    (pay, keys, kcount, ucount)
+}
+
+#[inline(never)]
+fn parse5_stage<const S: u8>(
+    chunk: &'static [u8],
+    ci: usize,
+    ws: i64,
+    we: i64,
+    products: &FxHashMap<B, u32>,
+) -> (Vec<PEv>, Vec<DKey>, Vec<u32>, Vec<u32>) {
+    let n = chunk.len();
+    assert!(n < (1 << 31), "chunk too large for the structural index");
+    let cap = n / 64 + 16;
+    let mut pay: Vec<PEv> = Vec::with_capacity(cap);
+    let mut keys: Vec<DKey> = Vec::with_capacity(cap);
+    let mut kcount = vec![0u32; NSH];
+    let mut ucount = vec![0u32; NSH]; // valid payloads per user shard
+    let mut cm = [0usize; 8];
+    let mut mc = MonthCache::new();
+    let mut pad = [0u8; 64];
+    // per-line structural scan: from each line start, load 64 B blocks and take the newline,
+    // comma and quote positions straight from the masks (no separator index array)
+    let mut next_start = 0usize;
+    while next_start < n {
+        let line_start = next_start;
+        // software prefetch: the file mapping is 4 KB pages, where the hardware prefetcher stops
+        #[cfg(target_feature = "sse")]
+        {
+            let pf = line_start + PF_DIST;
+            if pf < n {
+                // SAFETY: in-bounds address; prefetch has no architectural effect
+                unsafe { std::arch::x86_64::_mm_prefetch(chunk.as_ptr().add(pf) as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+            }
+        }
+        let mut k = 0usize;
+        let mut nq = 0u32;
+        // fast path only: line-relative comma and quote masks and the newline offset
+        let mut fastm: Option<(u128, u128, u32)> = None;
+        let mut off = line_start;
+        let end;
+        // fast path: the whole line (and its newline) within the next 128 bytes
+        if line_start + 128 <= n {
+            let (c0, n0, q0) = block_masks(&chunk[line_start..line_start + 64]);
+            let (c1, n1, q1) = block_masks(&chunk[line_start + 64..line_start + 128]);
+            let nl = (n0 as u128) | ((n1 as u128) << 64);
+            if nl != 0 {
+                let e = nl.trailing_zeros();
+                let below = (1u128 << e) - 1;
+                let cm128 = ((c0 as u128) | ((c1 as u128) << 64)) & below;
+                let q128 = ((q0 as u128) | ((q1 as u128) << 64)) & below;
+                end = line_start + e as usize;
+                next_start = end + 1;
+                if cm128.count_ones() != 6 {
+                    continue;
+                }
+                nq = q128.count_ones();
+                fastm = Some((cm128, q128, e));
+                let mut m = cm128;
+                for slot in cm.iter_mut().take(6) {
+                    *slot = line_start + m.trailing_zeros() as usize;
+                    m &= m - 1;
+                }
+                k = 6;
+            } else {
+                end = usize::MAX; // no newline within 128 bytes: fall back to the block loop
+            }
+        } else {
+            end = usize::MAX;
+        }
+        let end = if end != usize::MAX {
+            end
+        } else {
+            k = 0;
+            nq = 0;
+            let end;
+            loop {
+            let blk: &[u8] = if off + 64 <= n {
+                &chunk[off..off + 64]
+            } else {
+                pad = [0u8; 64];
+                pad[..n - off].copy_from_slice(&chunk[off..n]);
+                &pad
+            };
+            let (c, nl, q) = block_masks(blk);
+            let below = if nl != 0 { (1u64 << nl.trailing_zeros()) - 1 } else { u64::MAX };
+            let mut cmask = c & below;
+            nq += (q & below).count_ones();
+            while cmask != 0 {
+                if k < 8 {
+                    cm[k] = off + cmask.trailing_zeros() as usize;
+                }
+                k += 1;
+                cmask &= cmask - 1;
+            }
+            if nl != 0 {
+                end = off + nl.trailing_zeros() as usize;
+                break;
+            }
+            off += 64;
+            if off >= n {
+                end = n;
+                break;
+            }
+            }
+            next_start = end + 1;
+            if k != 6 {
+                continue;
+            }
+            end
+        };
+        if S == 1 {
+            std::hint::black_box((end, nq, cm[5]));
+            continue;
+        }
+        // field k spans [fs_k, fe_k); strip quotes around whole fields; validate the quote count
+            let mut fb = [(0usize, 0usize); 7];
+            let mut pairs = 0u32;
+            let mut fs = line_start;
+            if let Some((cm128, q128, e)) = fastm {
+                // all 7 fields at once from the masks (same rule as the loop below): field k is
+                // quoted iff its first and last characters are quotes and it is >= 2 long
+                let starts = 1u128 | (cm128 << 1); // first character of each field
+                let seps = cm128 | (1u128 << e); // the separator after each field
+                let qs = pext128(q128, starts); // bit k: field k starts with a quote
+                let qe = pext128(q128 << 1, seps); // bit k: field k ends with a quote
+                let one = pext128((starts << 1) & seps, seps); // bit k: field k is 1 long
+                let qb = (qs & qe & !one) as u32 & 0x7F;
+                pairs = qb.count_ones();
+                for k in 0..7 {
+                    let fe = if k < 6 { cm[k] } else { end };
+                    let isq = ((qb >> k) & 1) as usize;
+                    fb[k] = (fs + isq, fe - isq);
+                    fs = fe + 1;
+                }
+            } else {
+            for k in 0..7 {
+                let fe = if k < 6 { cm[k] } else { end };
+                let flen = fe - fs;
+                let first = *chunk.get(fs).unwrap_or(&0);
+                let last = *chunk.get(fe.wrapping_sub(1).max(fs)).unwrap_or(&0);
+                let isq = ((nq > 0) & (flen >= 2) & (first == b'"') & (last == b'"')) as usize;
+                pairs += isq as u32;
+                fb[k] = (fs + isq, fe - isq);
+                fs = fe + 1;
+            }
+            }
+            if nq != 2 * pairs {
+                continue; // a quote that is not around a whole field
+            }
+            if S == 2 {
+                std::hint::black_box(fb);
+                continue;
+            }
+            let field = |k: usize| -> Option<B> {
+                let (a, b) = fb[k];
+                if a < b { Some(&chunk[a..b]) } else { None }
+            };
+            let Some(eid) = field(0) else { continue };
+            let ing = mc.f1(field(3));
+            let ts = parse_ts_over(field(2));
+            let uid = field(1);
+            let kind = event_kind(field(4));
+            let pid = field(5);
+            let mut ok = uid.is_some() && pid.is_some() && kind < 3 && ts != BAD && ts >= ws && ts < we;
+            let mut p = 0u32;
+            let mut cat = 0u16;
+            if ok && kind == 2 {
+                match parse_price(field(6)) {
+                    Some(v) => {
+                        p = v as u32;
+                        cat = match products.get(pid.unwrap()) {
+                            Some(&c) => c as u16,
+                            None => u16::MAX,
+                        };
+                    }
+                    None => ok = false,
+                }
+            }
+            if ok && ing - ts > DAY {
+                ok = false;
+            }
+            if S == 3 {
+                std::hint::black_box((ok, p, cat, ing));
+                continue;
             }
             let mut idx = u32::MAX as u64;
             let mut ush = 0u64;
@@ -1713,6 +1944,30 @@ fn partition_counted<T: Copy + Send + Sync>(
 
 /// Like partition_counted; the output's allocation is at least `min_bytes` so that a later
 /// stage can reuse the same (already faulted-in) block through the recycling allocator.
+/// Parallel bit extract over 128 bits (BMI2 pext on each half).
+#[inline(always)]
+fn pext128(x: u128, m: u128) -> u128 {
+    let (xl, xh, ml, mh) = (x as u64, (x >> 64) as u64, m as u64, (m >> 64) as u64);
+    #[cfg(target_feature = "bmi2")]
+    // SAFETY: bmi2 is enabled for this build
+    let (lo, hi) = unsafe { (std::arch::x86_64::_pext_u64(xl, ml), std::arch::x86_64::_pext_u64(xh, mh)) };
+    #[cfg(not(target_feature = "bmi2"))]
+    let (lo, hi) = {
+        let soft = |x: u64, mut m: u64| {
+            let (mut r, mut b) = (0u64, 0u32);
+            while m != 0 {
+                let t = m.trailing_zeros();
+                r |= ((x >> t) & 1) << b;
+                b += 1;
+                m &= m - 1;
+            }
+            r
+        };
+        (soft(xl, ml), soft(xh, mh))
+    };
+    (lo as u128) | ((hi as u128) << ml.count_ones())
+}
+
 /// Copy `lines` x 64 bytes (unaligned) with full-width vector moves.
 #[inline(always)]
 unsafe fn copy_lines(src: *const u8, dst: *mut u8, lines: usize) {
@@ -2207,6 +2462,27 @@ last,b,c,d,e,f,g"#
             }
         }
         eprintln!("SELFTEST ok: two-stage parser identical on {cks} chunk variants");
+        std::process::exit(0);
+    }
+    if let Ok(lv) = std::env::var("PARSESTAGE") {
+        // single-threaded parser cost up to a stage: 1 structure, 2 field bounds + quotes, 3 values, 4 full
+        let lv: u8 = lv.parse().unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = Instant::now();
+            for (ci, &c) in ev_chunks.iter().enumerate() {
+                let o = match lv {
+                    1 => parse5_stage::<1>(c, ci, ws, we, &products),
+                    2 => parse5_stage::<2>(c, ci, ws, we, &products),
+                    3 => parse5_stage::<3>(c, ci, ws, we, &products),
+                    _ => parse_event_chunk5(c, ci, ws, we, &products),
+                };
+                std::hint::black_box(&o);
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        let lines = 20.811e6;
+        eprintln!("PARSESTAGE {lv}: {:.3}s  {:.1} ns/line", best, best * 1e9 / lines);
         std::process::exit(0);
     }
     if std::env::var_os("PARSE5BENCH").is_some() {
