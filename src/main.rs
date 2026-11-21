@@ -3100,20 +3100,35 @@ last,b,c,d,e,f,g"#
     lap("links joined");
     // Resolve users to exact person ids, one uid-hash shard at a time (its tables fit in cache).
     // Linked user -> root index (< 2^31). Unlinked user -> 1<<31 | shard<<22 | local index.
-    let resolved: Vec<(Vec<PR>, Vec<CR>, Vec<B>, Vec<u32>, Vec<u32>)> = (0..NSH)
+    // All shards' person records go into two buffers sized up front (one PR per winner, one CR
+    // per click), so they come from the huge-page recycling allocator instead of 256 fresh
+    // per-shard vectors faulted in 4 KB pages; the lookup tables are reused per thread.
+    let mut prs_all: Vec<PR> = Vec::with_capacity(uev_all.len());
+    let mut crs_all: Vec<CR> = Vec::with_capacity(ucl_all.len());
+    // SAFETY: every slot is written exactly once below (shard slices cover the buffers)
+    unsafe {
+        prs_all.set_len(uev_all.len());
+        crs_all.set_len(ucl_all.len());
+    }
+    let prs_slices = shard_slices(&mut prs_all, &uev_off);
+    let crs_slices = shard_slices(&mut crs_all, &ucl_off);
+    let jobs: Vec<(usize, (&mut [PR], &mut [CR]))> = prs_slices.into_iter().zip(crs_slices).enumerate().collect();
+    let resolved: Vec<(Vec<B>, Vec<u32>, Vec<u32>)> = jobs
         .into_par_iter()
-        .map(|shi| {
+        .map_init(
+            || (FxHashMap::<u64, (u64, u32)>::default(), FxHashMap::<(u64, u64), u32>::default()),
+            |(tab, side), (shi, (prs_out, crs_out))| {
             let lkm = &lks[shi];
-            // one table per shard: uid h64 -> (uid h2, pid), pre-filled with the shard's linked
-            // users and extended with unlinked ones as they appear (one lookup per record)
-            let mut tab: FxHashMap<u64, (u64, u32)> = FxHashMap::default();
+            // uid h64 -> (uid h2, pid), pre-filled with the shard's linked users and extended
+            // with unlinked ones as they appear (one lookup per record); reused across shards
+            tab.clear();
+            side.clear(); // 64-bit hash clashes
             if !lk_clash {
                 tab.reserve(lkm.len() * 2 + 1024);
                 for &(k, v) in lkm.iter() {
                     tab.insert(k, v);
                 }
             }
-            let mut side: FxHashMap<(u64, u64), u32> = FxHashMap::default(); // 64-bit hash clashes
             let mut unl_names: Vec<B> = Vec::new();
             let nroots = roots_by_shard[shi].len() as u32;
             let new_unlinked = |u: B, unl_names: &mut Vec<B>| -> u32 {
@@ -3157,68 +3172,54 @@ last,b,c,d,e,f,g"#
                 }
             };
             let evs = &uev_all[uev_off[shi]..uev_off[shi + 1]];
-            let mut prs: Vec<PR> = Vec::with_capacity(evs.len());
+            assert!(prs_out.len() == evs.len(), "person record slice");
+            let mut pc = vec![0u32; NSH];
             let mut pos = 0usize;
             for (c, counts) in wc_keep.iter().enumerate() {
                 let n = counts[shi] as usize;
                 let base = ev_chunks[c].as_ptr() as usize;
-                for e in &evs[pos..pos + n] {
+                for (e, d) in evs[pos..pos + n].iter().zip(prs_out[pos..pos + n].iter_mut()) {
                     let pid = pid_of(NameRef::Scan(base + e.uoff as usize), e.pk, e.pk2 as u64);
-                    prs.push(PR { key: ((pid as u64) << 32) | e.ts as u64, price: e.price, cat: e.cat });
+                    pc[(pid >> PL_BITS) as usize] += 1;
+                    *d = PR { key: ((pid as u64) << 32) | e.ts as u64, price: e.price, cat: e.cat };
                 }
                 pos += n;
             }
             assert!(pos == evs.len(), "user shuffle layout");
             let cls = &ucl_all[ucl_off[shi]..ucl_off[shi + 1]];
-            let crs: Vec<CR> = cls
-                .iter()
-                .map(|c| CR {
-                    key: ((pid_of(NameRef::Scan(cl_chunks[(c.uref >> CREF_OFF_BITS) as usize].as_ptr() as usize + (c.uref & CREF_OFF_MASK) as usize), c.uh, c.uh2 as u64) as u64) << 32) | c.ts as u64,
-                    camp: c.camp,
-                    cref: c.cref,
-                })
-                .collect();
-            let mut pc = vec![0u32; NSH];
-            for r in &prs {
-                pc[(r.key >> (32 + PL_BITS)) as usize] += 1;
-            }
             let mut cc = vec![0u32; NSH];
-            for c in &crs {
-                cc[(c.key >> (32 + PL_BITS)) as usize] += 1;
+            for (c, d) in cls.iter().zip(crs_out.iter_mut()) {
+                let pid = pid_of(NameRef::Scan(cl_chunks[(c.uref >> CREF_OFF_BITS) as usize].as_ptr() as usize + (c.uref & CREF_OFF_MASK) as usize), c.uh, c.uh2 as u64);
+                cc[(pid >> PL_BITS) as usize] += 1;
+                *d = CR { key: ((pid as u64) << 32) | c.ts as u64, camp: c.camp, cref: c.cref };
             }
-            (prs, crs, unl_names, pc, cc)
+            (unl_names, pc, cc)
         })
         .collect();
     drop(uev_all);
     drop(ucl_all);
-    let mut prs_parts = Vec::with_capacity(NSH);
-    let mut crs_parts = Vec::with_capacity(NSH);
     let mut unl_names_by_shard: Vec<Vec<B>> = Vec::with_capacity(NSH);
     let mut pcs = Vec::with_capacity(NSH);
     let mut ccs = Vec::with_capacity(NSH);
-    for (a, b, c, d, e) in resolved {
-        prs_parts.push(a);
-        crs_parts.push(b);
+    for (c, d, e) in resolved {
         unl_names_by_shard.push(c);
         pcs.push(d);
         ccs.push(e);
     }
+    let prs_parts: Vec<&[PR]> = (0..NSH).map(|sh| &prs_all[uev_off[sh]..uev_off[sh + 1]]).collect();
+    let crs_parts: Vec<&[CR]> = (0..NSH).map(|sh| &crs_all[ucl_off[sh]..ucl_off[sh + 1]]).collect();
     // person ids are final (shard << PL_BITS | index): partition straight by their shard
     let name_of_pid = |pid: u32| -> B {
         let (sh, l) = ((pid >> PL_BITS) as usize, (pid & PL_MASK) as usize);
         let roots = &roots_by_shard[sh];
         if l < roots.len() { roots[l] } else { unl_names_by_shard[sh][l - roots.len()] }
     };
-    let (mut pev_all, pev_off) = {
-        let refs: Vec<&[PR]> = prs_parts.iter().map(|v| v.as_slice()).collect();
-        partition_counted(&refs, Some(pcs), |_, _| true, |r: &PR| (r.key >> (32 + PL_BITS)) as usize)
-    };
+    let (mut pev_all, pev_off) = partition_counted(&prs_parts, Some(pcs), |_, _| true, |r: &PR| (r.key >> (32 + PL_BITS)) as usize);
     drop(prs_parts);
-    let (mut pcl_all, pcl_off) = {
-        let refs: Vec<&[CR]> = crs_parts.iter().map(|v| v.as_slice()).collect();
-        partition_counted(&refs, Some(ccs), |_, _| true, |c: &CR| (c.key >> (32 + PL_BITS)) as usize)
-    };
+    drop(prs_all);
+    let (mut pcl_all, pcl_off) = partition_counted(&crs_parts, Some(ccs), |_, _| true, |c: &CR| (c.key >> (32 + PL_BITS)) as usize);
     drop(crs_parts);
+    drop(crs_all);
     lap("events regrouped");
     // per person-shard: sessionize, attribute, aggregate
     // 40-byte output row (was 56): counts fit u32 (at most the event count); NO_TOP = no purchase
@@ -3257,24 +3258,45 @@ last,b,c,d,e,f,g"#
         assisted: u32,
     }
     let accs: Vec<std::sync::Mutex<Vec<CampAcc>>> = (0..nthreads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    // per-thread scratch reused across shards (no fresh 4 KB-page memory per shard):
+    // eoff, pos, coff, cpos, acnt, apos, enter, alist, then the event and click work buffers
+    #[derive(Default)]
+    struct Scratch {
+        u: [Vec<u32>; 8],
+        eg: Vec<PR>,
+        cg: Vec<CR>,
+    }
+    // output rows: one growing buffer per thread (large, so huge-page backed) instead of a small
+    // vector per shard; the writer groups rows by thread anyway
+    let rowsv: Vec<std::sync::Mutex<Vec<URow>>> = (0..nthreads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    let scrs: Vec<std::sync::Mutex<Scratch>> = (0..nthreads).map(|_| std::sync::Mutex::new(Scratch::default())).collect();
     let mut results: Vec<(Vec<URow>, Vec<CampAcc>)> = work
         .into_par_iter()
         .with_max_len(1)
         .map(|(sh, (evin, cls))| {
-            let mut urows: Vec<URow> = Vec::new();
             let ti = rayon::current_thread_index().unwrap_or(0) % nthreads;
+            let mut rguard = rowsv[ti].lock().unwrap();
+            let urows: &mut Vec<URow> = &mut rguard;
             let mut guard = accs[ti].lock().unwrap();
             if guard.is_empty() {
                 *guard = vec![CampAcc::default(); ncamp * ndays];
             }
             let camp: &mut Vec<CampAcc> = &mut guard;
+            let mut sguard = scrs[ti].lock().unwrap();
+            let scr: &mut Scratch = &mut sguard;
+            let mut take_u = |k: usize| std::mem::take(&mut scr.u[k]);
+            let (mut eoff, mut pos, mut coff, mut cpos) = (take_u(0), take_u(1), take_u(2), take_u(3));
+            let (mut acnt, mut apos, mut enter, mut alist) = (take_u(4), take_u(5), take_u(6), take_u(7));
+            let (mut eg, mut cg) = (std::mem::take(&mut scr.eg), std::mem::take(&mut scr.cg));
             // group by person with a counting sort over the shard's contiguous id range, then sort
             // each person's (few) events by time; clicks are grouped the same way
             let base = (sh as u32) << PL_BITS;
             let np = roots_by_shard[sh].len() + unl_names_by_shard[sh].len();
             let li = |key: u64| -> usize { ((key >> 32) as u32 - base) as usize };
-            let mut eoff = vec![0u32; np + 1];
-            let mut eg: Vec<PR> = Vec::with_capacity(evin.len());
+            eoff.clear();
+            eoff.resize(np + 1, 0);
+            eg.clear();
+            eg.reserve(evin.len());
             // SAFETY: every slot in 0..evin.len() is written exactly once below
             unsafe { eg.set_len(evin.len()) };
             // whole-shard stable radix sort by ts (3 passes, ends in eg; the person count rides on
@@ -3284,22 +3306,26 @@ last,b,c,d,e,f,g"#
             for p in 0..np {
                 eoff[p + 1] += eoff[p];
             }
-            let mut pos = eoff.clone();
+            pos.clear();
+            pos.extend_from_slice(&eoff);
             for r in evin.iter() {
                 let l = li(r.key);
                 eg[pos[l] as usize] = *r;
                 pos[l] += 1;
             }
-            let mut coff = vec![0u32; np + 1];
+            coff.clear();
+            coff.resize(np + 1, 0);
             let ncl = cls.len();
-            let mut cg: Vec<CR> = Vec::with_capacity(ncl);
+            cg.clear();
+            cg.reserve(ncl);
             // SAFETY: every slot in 0..ncl is written exactly once below
             unsafe { cg.set_len(ncl) };
             radix_22(cls, &mut cg, |c: &CR| (c.key as u32) >> 9, |c: &CR| coff[li(c.key) + 1] += 1);
             for p in 0..np {
                 coff[p + 1] += coff[p];
             }
-            let mut cpos = coff.clone();
+            cpos.clear();
+            cpos.extend_from_slice(&coff);
             for c in cls.iter() {
                 let l = li(c.key);
                 cg[cpos[l] as usize] = *c;
@@ -3308,12 +3334,15 @@ last,b,c,d,e,f,g"#
             let mut cats: Vec<(u32, i64)> = vec![];
             // campaigns with clicks in the 7-day window: per-campaign counters + dense list with
             // positions, so add / expire / iterate are O(1) per click
-            let mut acnt: Vec<u32> = vec![0; ncamp];
-            let mut apos: Vec<u32> = vec![0; ncamp];
-            let mut alist: Vec<u32> = Vec::new();
+            // acnt is all zero between shards (the last person's entries are cleared below)
+            if acnt.len() != ncamp {
+                acnt = vec![0; ncamp];
+                apos = vec![0; ncamp];
+                enter = vec![0; ncamp];
+            }
+            alist.clear();
             // lazy assists: a campaign's assisted count for a day is added when it leaves the window
             // or the day changes (sessions since enter[c]), not once per session
-            let mut enter: Vec<u32> = vec![0; ncamp];
             for p in 0..np {
                 if eoff[p] == eoff[p + 1] {
                     continue; // no events: this person has no sessions
@@ -3446,9 +3475,18 @@ last,b,c,d,e,f,g"#
                     urows.push(finish(r, &mut cats, &cat_names));
                 }
             }
-            (urows, Vec::new())
+            for &c in &alist {
+                acnt[c as usize] = 0;
+            }
+            scr.u = [eoff, pos, coff, cpos, acnt, apos, enter, alist];
+            scr.eg = eg;
+            scr.cg = cg;
+            (Vec::new(), Vec::new())
         })
         .collect();
+    for r in rowsv {
+        results.push((r.into_inner().unwrap(), Vec::new()));
+    }
     for a in accs {
         results.push((Vec::new(), a.into_inner().unwrap()));
     }
