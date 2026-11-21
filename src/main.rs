@@ -968,7 +968,41 @@ fn parse_event_chunk5(
         let mut nq = 0u32;
         let mut off = line_start;
         let end;
-        loop {
+        // fast path: the whole line (and its newline) within the next 128 bytes
+        if line_start + 128 <= n {
+            let (c0, n0, q0) = block_masks(&chunk[line_start..line_start + 64]);
+            let (c1, n1, q1) = block_masks(&chunk[line_start + 64..line_start + 128]);
+            let nl = (n0 as u128) | ((n1 as u128) << 64);
+            if nl != 0 {
+                let e = nl.trailing_zeros();
+                let below = (1u128 << e) - 1;
+                let cm128 = ((c0 as u128) | ((c1 as u128) << 64)) & below;
+                let q128 = ((q0 as u128) | ((q1 as u128) << 64)) & below;
+                end = line_start + e as usize;
+                next_start = end + 1;
+                if cm128.count_ones() != 6 {
+                    continue;
+                }
+                nq = q128.count_ones();
+                let mut m = cm128;
+                for slot in cm.iter_mut().take(6) {
+                    *slot = line_start + m.trailing_zeros() as usize;
+                    m &= m - 1;
+                }
+                k = 6;
+            } else {
+                end = usize::MAX; // no newline within 128 bytes: fall back to the block loop
+            }
+        } else {
+            end = usize::MAX;
+        }
+        let end = if end != usize::MAX {
+            end
+        } else {
+            k = 0;
+            nq = 0;
+            let end;
+            loop {
             let blk: &[u8] = if off + 64 <= n {
                 &chunk[off..off + 64]
             } else {
@@ -996,11 +1030,13 @@ fn parse_event_chunk5(
                 end = n;
                 break;
             }
-        }
-        next_start = end + 1;
-        if k != 6 {
-            continue;
-        }
+            }
+            next_start = end + 1;
+            if k != 6 {
+                continue;
+            }
+            end
+        };
         // field k spans [fs_k, fe_k); strip quotes around whole fields; validate the quote count
             let mut fb = [(0usize, 0usize); 7];
             let mut pairs = 0u32;
@@ -1876,6 +1912,7 @@ fn main() {
     // links run on their own thread, overlapping event parsing and dedup (nothing there needs them)
     let ln_bufs2 = ln_bufs.clone();
     let links_job = std::thread::spawn(move || {
+    let lt0 = Instant::now();
     // links: union-find, root kept as byte-wise smallest ID
     let pairs: Vec<(B, B)> = chunks(&ln_bufs2)
         .iter()
@@ -1971,26 +2008,16 @@ fn main() {
     }
     let rootv: Vec<u32> = (0..it.names.len() as u32).map(|i| it.find(i)).collect();
     let it = it;
-    // linked uid h64 -> (uid h2, root h64, root h2, root index): one cache miss per lookup
-    let mut lk: FxHashMap<u64, (u64, u32)> = FxHashMap::default();
-    lk.reserve(it.names.len());
-    let mut lk_clash = it.clash;
+    // linked users split by uid-hash shard as plain (uid h64, (uid h2, root index)) lists: the
+    // resolve stage only iterates them to pre-fill its per-shard tables. Two linked IDs sharing a
+    // 64-bit hash already set it.clash in the interner, which selects the exact path.
+    let lk_clash = it.clash;
+    let mut lks: Vec<Vec<(u64, (u64, u32))>> = (0..NSH).map(|_| Vec::new()).collect();
     for (i, &n) in it.names.iter().enumerate() {
-        let r = rootv[i] as usize;
-        let v = (h2(n), r as u32);
-        if lk.insert(it.hashes[i], v).is_some() {
-            lk_clash = true; // two linked IDs share a 64-bit hash: use the exact path
-        }
+        let h = it.hashes[i];
+        lks[shard_h(h)].push((h, (h2(n), rootv[i])));
     }
-    // the same table split by uid-hash shard, so each shard's lookups stay in cache
-    let lks: Vec<FxHashMap<u64, (u64, u32)>> = {
-        let mut parts: Vec<Vec<(u64, (u64, u32))>> = (0..NSH).map(|_| Vec::new()).collect();
-        for (&k, &v) in &lk {
-            parts[shard_h(k)].push((k, v));
-        }
-        parts.into_iter().map(|v| v.into_iter().collect()).collect()
-    };
-    drop(lk);
+        eprintln!("{:>8.3}s   (links thread done after {:.3}s)", t0.elapsed().as_secs_f64(), lt0.elapsed().as_secs_f64());
         (it, rootv, lk_clash, lks)
     });
 
@@ -2355,7 +2382,7 @@ last,b,c,d,e,f,g"#
             let mut tab: FxHashMap<u64, (u64, u32)> = FxHashMap::default();
             if !lk_clash {
                 tab.reserve(lkm.len() * 2 + 1024);
-                for (&k, &v) in lkm.iter() {
+                for &(k, v) in lkm.iter() {
                     tab.insert(k, v);
                 }
             }
