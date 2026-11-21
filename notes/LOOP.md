@@ -205,3 +205,4 @@ Note: docker works here (start dockerd; base images from local shopping-sessions
 | 60M check | v56 vs v54 at 60M (10 pairs) | wall 4.196 / cpu 15.94 | 4.329 (4/10) / 16.24 (5/10) | no gain at the final size either: main stays v54 |
 | diag | links at 60M (NCPU=1): 2.66M pairs, intern+union-find 0.52 s (195 ns/pair vs 140 at 20M: 128 MB table), whole thread 0.87 s CPU = ~5% of run CPU | — | — | sort-based interning would save ~2-3%: below what this VM can measure |
 | diag | perf cycles/instructions not supported in this VM; task-clock of the SAME binary varies 10% run to run (5.10-5.59 s) | — | — | no lower-noise measure available |
+| G31 | links interning by radix sort (4 x 16-bit digits) instead of the hash table | links thread (NCPU=1) 0.261 s at 20M, 0.885 at 60M | 0.340, 1.190 | slower (65536-way scatter has worse locality than the prefetched table); exact (gate, seeds 212-213, 60M output identical): reverted (main.g31ls.rs) |
