@@ -258,3 +258,4 @@ PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried 
 | v59 @60M #2 | second 60M set vs v58 | 4.228 / cpu 15.88 | 4.260 (4/10) / 16.07 (3/10) | 60M pooled 7/20: slightly worse at the final size -> main stays v58 (v59 only on dev) |
 | R34 | PGO + -C llvm-args=-enable-ext-tsp-block-placement=1 | v58: wall 1.234 / 1.232 | 1.285 (5/24) / 1.264 (4/24) | worse (~3-4%): not adopted |
 | R35 | PGO profile weighted toward 60M (current p20m profile x3 + one p60m run x1) | v58: 60M 4.337 / 4.245; 20M 1.269 | 60M 4.153 (7/10) / 4.215 (7/12, cpu 4/12); 20M 1.317 (4/24) | 60M pooled ~tie (wall 14/22, cpu 11/22), 20M worse: not adopted |
+| R36 | -C target-cpu=skylake-avx512 instead of cascadelake (same ISA; PGO) | v58: 20M 1.274 / 1.286; 60M 4.240 | 1.214 (15/24) / 1.266 (16/24); 60M 4.373 (3/10) | 20M borderline (31/48), 60M worse: not adopted |
