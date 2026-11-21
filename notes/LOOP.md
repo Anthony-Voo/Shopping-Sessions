@@ -213,3 +213,6 @@ Note: docker works here (start dockerd; base images from local shopping-sessions
 | diag | parse tail balance (20M warm): 4 threads finish within ~20 ms of each other (~1% idle) | — | — | not a lever |
 | diag | parser line profile (PARSESTAGE=4, 62.5 ns/line): flat — comma extraction + u128 helpers ~12%, event ts ~8.5%, field bounds/quotes ~5%, two id hashes ~5.5%, nothing > 6% alone | — | — | — |
 | G32 | comma positions via BMI2 pdep per k (parallel) instead of the clear-lowest-bit chain on u128 | 62.6-65.4 ns/line | 67.3-75.0 | slower: reverted |
+| G33 | AES-NI id hash (aesenc rounds) instead of the 128-bit multiply chain, everywhere | 63.6-68.3 ns/line | 68.2-73.0 | not faster: reverted (exact: SELFTEST, gate, seeds 215-216) |
+
+USER DIRECTION (Nov 21 ~16:00 UTC): stop creating new designs/experiments; keep refining the current best code (v54 = main; dev v56 = v54 + exact ties) with small incremental edits, keep only confirmed improvements, fewer tests.
