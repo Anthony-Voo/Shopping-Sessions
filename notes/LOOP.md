@@ -237,3 +237,4 @@ USER DIRECTION (Nov 21 ~16:00 UTC): stop creating new designs/experiments; keep 
 | R17 | parse: skip a lane? no — raw-pointer pushes rejected on analysis (a key-emitting line can be 8 bytes, so the n/64 pre-size is not a bound; push's capacity branch is predictable) | — | — | not attempted |
 | noise | same binary, 16 runs: plain cv 3.8%, nice -n -20 cv 6.8% (worse) | — | — | set-to-set drift comes from VM neighbours; interleaved pair counts stay the measure |
 | R18 | G17 (ingest_ts decode without re-validation once the month is cached) re-tested on v57, two 24-run sets | 1.277 / 1.227 | 1.238 (18/24) / 1.234 (9/24); pooled 27/48 | tie: reverted (exact: gate + seed 223) |
+| R19 | refine best: URow 40 -> 32 B (person id instead of name slice; name looked up at write time) | sess+write lap 0.2650, total 1.264 (16) | 0.2770 (4/16), 1.217 | lap worse (random name lookups at write time): reverted (exact: gate + seed 224) |
