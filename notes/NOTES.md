@@ -37,3 +37,6 @@ Most local wins were CPU-stage wins on 4 dedicated threads; the scorer is 8 hype
 
 ## Nov 21 ~14:45 UTC: main fast-forwarded to 850b4d3 (v54)
 v54 vs v51 (24 interleaved runs, 20M): wall 1.444 -> 1.353 s (-6.3%), CPU -6.9%; at 60M a tie (4.60 -> 4.57). Not yet submitted; predicted board ~1.10-1.15 s (v51 scored 1.19).
+
+## Optional board experiment (prepared Nov 21 ~15:35 UTC)
+Branch exp-sh10, SHA 7d7abd0 = v54 with 1024 shards. Same output as v54. This VM has 2 MB L2 / 260 MB L3, the scorer ~1 MB L2 and a small L3, so smaller shards may help there (locally a slight loss at 60M). Submit by SHA only if a spare submission is available; compare with v54 (main 850b4d3).
