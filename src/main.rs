@@ -3391,24 +3391,10 @@ last,b,c,d,e,f,g"#
                 let mut row: Option<URow> = None;
                 let mut k = i;
                 while k < j {
-                    // one session: extend while gap between distinct timestamps <= GAP
+                    // one session: extend while gap between distinct timestamps <= GAP. Its day
+                    // (from the start) is known first, so purchases go straight into the row's
+                    // category totals in the same pass (no second walk over the events)
                     let start = ets(&evs[k]);
-                    let mut prev = start;
-                    let mut e = k;
-                    let (mut n, mut rev, mut purch) = (0i64, 0i64, false);
-                    while e < j {
-                        let t = ets(&evs[e]);
-                        if !(t == prev || t - prev <= GAP) {
-                            break;
-                        }
-                        prev = t;
-                        n += 1;
-                        if evs[e].price > 0 {
-                            purch = true;
-                            rev += evs[e].price as i64;
-                        }
-                        e += 1;
-                    }
                     let day = start.div_euclid(DAY) as i32;
                     if day != cur_day {
                         if let Some(r) = row.take() {
@@ -3423,19 +3409,32 @@ last,b,c,d,e,f,g"#
                         cur_day = day;
                         row = Some(URow { name, day, sessions: 0, events: 0, revenue: 0, top: NO_TOP });
                     }
-                    let r = row.as_mut().unwrap();
-                    r.sessions += 1;
-                    r.events += n as u32;
-                    r.revenue += rev;
-                    for x in &evs[k..e] {
+                    let mut prev = start;
+                    let mut e = k;
+                    let (mut rev, mut purch) = (0i64, false);
+                    while e < j {
+                        let x = evs[e];
+                        let t = ets(&x);
+                        if !(t == prev || t - prev <= GAP) {
+                            break;
+                        }
+                        prev = t;
                         if x.price > 0 {
+                            purch = true;
+                            rev += x.price as i64;
                             let xc = if x.cat == u16::MAX { UNKNOWN_CAT } else { x.cat as u32 };
                             match cats.iter_mut().find(|c| c.0 == xc) {
                                 Some(c) => c.1 += x.price as i64,
                                 None => cats.push((xc, x.price as i64)),
                             }
                         }
+                        e += 1;
                     }
+                    let n = (e - k) as i64;
+                    let r = row.as_mut().unwrap();
+                    r.sessions += 1;
+                    r.events += n as u32;
+                    r.revenue += rev;
                     // attribution window: start - WEEK <= click.ts <= start
                     while hi < pcl.len() && cts(&pcl[hi]) <= start {
                         let c = pcl[hi].camp as usize;
