@@ -24,6 +24,8 @@ const BAD: i64 = i64::MIN; // unparseable timestamp
 const HUGE: i64 = i64::MAX; // F3 too long for i64: valid form, outside every window
 const SH_BITS: u32 = 8; // shard count = 2^SH_BITS
 const NSH: usize = 1 << SH_BITS;
+const PL_BITS: u32 = 32 - SH_BITS; // person id = person shard << PL_BITS | index within the shard
+const PL_MASK: u32 = (1 << PL_BITS) - 1;
 const PF_DIST: usize = 2048; // parser prefetch distance (bytes)
 const CHUNK: usize = 32 << 20; // bytes per parse task
 const ORGANIC: u32 = u32::MAX;
@@ -2437,6 +2439,22 @@ fn main() {
     }
     let rootv: Vec<u32> = (0..it.names.len() as u32).map(|i| it.find(i)).collect();
     let it = it;
+    // final person ids: a root takes the next index of its own uid shard; unlinked users of that
+    // shard are numbered after its roots in the resolve stage. No remap pass is needed later.
+    let mut roots_by_shard: Vec<Vec<u32>> = (0..NSH).map(|_| Vec::new()).collect();
+    let mut rloc = vec![0u32; it.names.len()];
+    for i in 0..it.names.len() {
+        if rootv[i] as usize == i {
+            let ps = shard_h(it.hashes[i]);
+            assert!(roots_by_shard[ps].len() < PL_MASK as usize, "too many people in one shard");
+            rloc[i] = ((ps as u32) << PL_BITS) | roots_by_shard[ps].len() as u32;
+            roots_by_shard[ps].push(i as u32);
+        }
+    }
+    let rootv: Vec<u32> = rootv.iter().map(|&r| rloc[r as usize]).collect();
+    drop(rloc);
+    // each shard's root names contiguous, in person-index order (sessionize reads them in order)
+    let roots_by_shard: Vec<Vec<B>> = roots_by_shard.iter().map(|v| v.iter().map(|&i| it.names[i as usize]).collect()).collect();
     // linked users split by uid-hash shard as plain (uid h64, (uid h2, root index)) lists: the
     // resolve stage only iterates them to pre-fill its per-shard tables. Two linked IDs sharing a
     // 64-bit hash already set it.clash in the interner, which selects the exact path.
@@ -2448,7 +2466,7 @@ fn main() {
         lks[shard_h(h)].push((h, (t2, rootv[i])));
     }
         eprintln!("{:>8.3}s   (links thread done after {:.3}s)", t0.elapsed().as_secs_f64(), lt0.elapsed().as_secs_f64());
-        (it, rootv, lk_clash, lks)
+        (it, rootv, lk_clash, lks, roots_by_shard)
     });
 
     // events: parse + validate each copy, scatter by event_id
@@ -2852,7 +2870,7 @@ last,b,c,d,e,f,g"#
     drop(ucl_refs);
     drop(ucls);
     lap("clicks parsed");
-    let (it, rootv, lk_clash, lks) = links_job.join().expect("links thread");
+    let (it, rootv, lk_clash, lks, roots_by_shard) = links_job.join().expect("links thread");
     lap("links joined");
     // Resolve users to exact person ids, one uid-hash shard at a time (its tables fit in cache).
     // Linked user -> root index (< 2^31). Unlinked user -> 1<<31 | shard<<22 | local index.
@@ -2871,11 +2889,12 @@ last,b,c,d,e,f,g"#
             }
             let mut side: FxHashMap<(u64, u64), u32> = FxHashMap::default(); // 64-bit hash clashes
             let mut unl_names: Vec<B> = Vec::new();
-            let mut new_unlinked = |u: B, unl_names: &mut Vec<B>| -> u32 {
-                let local = unl_names.len() as u32;
+            let nroots = roots_by_shard[shi].len() as u32;
+            let new_unlinked = |u: B, unl_names: &mut Vec<B>| -> u32 {
+                let local = nroots + unl_names.len() as u32;
                 unl_names.push(u);
-                assert!(local < (1 << (31 - SH_BITS)), "too many unlinked users in one shard");
-                (1u32 << 31) | ((shi as u32) << (31 - SH_BITS)) | local
+                assert!(local < PL_MASK, "too many people in one shard");
+                ((shi as u32) << PL_BITS) | local
             };
             let mut pid_of = |u: B, uh: u64, u2: u64| -> u32 {
                 let u2 = u2 as u32 as u64; // 96-bit user identity: h64 + low 32 bits of h2
@@ -2931,11 +2950,11 @@ last,b,c,d,e,f,g"#
                 .collect();
             let mut pc = vec![0u32; NSH];
             for r in &prs {
-                pc[shard_pid((r.key >> 32) as u32)] += 1;
+                pc[(r.key >> (32 + PL_BITS)) as usize] += 1;
             }
             let mut cc = vec![0u32; NSH];
             for c in &crs {
-                cc[shard_pid((c.key >> 32) as u32)] += 1;
+                cc[(c.key >> (32 + PL_BITS)) as usize] += 1;
             }
             (prs, crs, unl_names, pc, cc)
         })
@@ -2954,62 +2973,20 @@ last,b,c,d,e,f,g"#
         pcs.push(d);
         ccs.push(e);
     }
-    drop(pcs);
-    drop(ccs);
-    // Dense person ids: linked people keep their root index (< R); unlinked users get
-    // R + (their uid shard's offset) + local index. Person shards own contiguous id ranges,
-    // so sessionizing can index people with arithmetic instead of hashing.
-    let r_count = it.names.len() as u32;
-    let mut uprefix = vec![0u32; NSH];
-    let mut run = r_count;
-    for sh in 0..NSH {
-        uprefix[sh] = run;
-        run += unl_names_by_shard[sh].len() as u32;
-    }
-    let total_p = run.max(1);
-    let span = (total_p as usize).div_ceil(NSH) as u32;
-    let dense = |pid: u32| -> u32 {
-        if pid < (1 << 31) {
-            pid
-        } else {
-            uprefix[((pid >> (31 - SH_BITS)) as usize) & (NSH - 1)] + (pid & ((1 << (31 - SH_BITS)) - 1))
-        }
+    // person ids are final (shard << PL_BITS | index): partition straight by their shard
+    let name_of_pid = |pid: u32| -> B {
+        let (sh, l) = ((pid >> PL_BITS) as usize, (pid & PL_MASK) as usize);
+        let roots = &roots_by_shard[sh];
+        if l < roots.len() { roots[l] } else { unl_names_by_shard[sh][l - roots.len()] }
     };
-    let pshard = |d: u32| -> usize { (d / span) as usize };
-    let pcs: Vec<Vec<u32>> = prs_parts
-        .par_iter_mut()
-        .map(|v| {
-            let mut c = vec![0u32; NSH];
-            for r in v.iter_mut() {
-                let d = dense((r.key >> 32) as u32);
-                r.key = ((d as u64) << 32) | (r.key & 0xFFFF_FFFF);
-                c[pshard(d)] += 1;
-            }
-            c
-        })
-        .collect();
-    let ccs: Vec<Vec<u32>> = crs_parts
-        .par_iter_mut()
-        .map(|v| {
-            let mut c = vec![0u32; NSH];
-            for x in v.iter_mut() {
-                let d = dense((x.key >> 32) as u32);
-                x.key = ((d as u64) << 32) | (x.key & 0xFFFF_FFFF);
-                c[pshard(d)] += 1;
-            }
-            c
-        })
-        .collect();
-    let unl_flat: Vec<B> = unl_names_by_shard.into_iter().flatten().collect();
-    let name_of_pid = |d: u32| -> B { if d < r_count { it.names[d as usize] } else { unl_flat[(d - r_count) as usize] } };
     let (mut pev_all, pev_off) = {
         let refs: Vec<&[PR]> = prs_parts.iter().map(|v| v.as_slice()).collect();
-        partition_counted(&refs, Some(pcs), |_, _| true, |r: &PR| pshard((r.key >> 32) as u32))
+        partition_counted(&refs, Some(pcs), |_, _| true, |r: &PR| (r.key >> (32 + PL_BITS)) as usize)
     };
     drop(prs_parts);
     let (mut pcl_all, pcl_off) = {
         let refs: Vec<&[CR]> = crs_parts.iter().map(|v| v.as_slice()).collect();
-        partition_counted(&refs, Some(ccs), |_, _| true, |c: &CR| pshard((c.key >> 32) as u32))
+        partition_counted(&refs, Some(ccs), |_, _| true, |c: &CR| (c.key >> (32 + PL_BITS)) as usize)
     };
     drop(crs_parts);
     lap("events regrouped");
@@ -3040,8 +3017,8 @@ last,b,c,d,e,f,g"#
         .fold(|| (Vec::<URow>::new(), vec![[0i64; 4]; ncamp * ndays]), |(mut urows, mut camp), (sh, (evs, cls))| {
             // group by person with a counting sort over the shard's contiguous id range, then sort
             // each person's (few) events by time; clicks are grouped the same way
-            let base = sh as u32 * span;
-            let np = span as usize;
+            let base = (sh as u32) << PL_BITS;
+            let np = roots_by_shard[sh].len() + unl_names_by_shard[sh].len();
             let li = |key: u64| -> usize { ((key >> 32) as u32 - base) as usize };
             let mut eoff = vec![0u32; np + 1];
             for r in evs.iter() {
