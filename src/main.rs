@@ -2072,6 +2072,31 @@ fn radix_22<T: Copy>(a: &mut [T], b: &mut [T], key: impl Fn(&T) -> u32, mut hook
     }
 }
 
+/// insertion_fix that also reports whether the sorted slice has two adjacent equal keys (each
+/// element's final left neighbour is compared when it settles, which covers every adjacent pair)
+fn insertion_fix_eq<T: Copy>(v: &mut [T], k: impl Fn(&T) -> u64) -> bool {
+    let mut eq = false;
+    for i in 1..v.len() {
+        let x = v[i];
+        let kx = k(&x);
+        let kp = k(&v[i - 1]);
+        if kp <= kx {
+            eq |= kp == kx;
+            continue;
+        }
+        let mut j = i;
+        while j > 0 && k(&v[j - 1]) > kx {
+            v[j] = v[j - 1];
+            j -= 1;
+        }
+        if j > 0 {
+            eq |= k(&v[j - 1]) == kx;
+        }
+        v[j] = x;
+    }
+    eq
+}
+
 /// Insertion sort for nearly sorted slices (here: already sorted by ts >> 9).
 #[inline]
 fn insertion_fix<T: Copy>(v: &mut [T], k: impl Fn(&T) -> u64) {
@@ -3447,12 +3472,7 @@ last,b,c,d,e,f,g"#
                 // eligible click is the winner (latest ts, then smallest click_id): fix equal-ts runs
                 let (c0, c1) = (coff[p] as usize, coff[p + 1] as usize);
                 let pcl = &mut cg[c0..c1];
-                insertion_fix(pcl, |c: &CR| c.key);
-                let mut eq = false;
-                for w in pcl.windows(2) {
-                    let (a, b) = (w[0].key, w[1].key);
-                    eq |= a == b;
-                }
+                let eq = insertion_fix_eq(pcl, |c: &CR| c.key);
                 if eq {
                     let mut a = 0;
                     while a < pcl.len() {
