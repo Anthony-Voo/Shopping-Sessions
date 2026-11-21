@@ -25,6 +25,70 @@ unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn mremap(old: *mut u8, old_len: usize, new_len: usize, flags: i32, new_addr: *mut u8) -> *mut u8;
+}
+const MREMAP_MAYMOVE: i32 = 1;
+const MREMAP_FIXED: i32 = 2;
+const MAP_FIXED: i32 = 0x10;
+static REMAP_OFF: AtomicBool = AtomicBool::new(false);
+static REMAP_INIT: AtomicBool = AtomicBool::new(false);
+
+/// Build a contiguous block of `len` bytes (a multiple of 2 MB) out of freed blocks by moving
+/// their pages with mremap (page-table moves: no copy and no zeroing); any shortfall is fresh.
+/// Called with the pool lock held. Returns null if nothing could be gathered.
+unsafe fn gather(len: usize) -> *mut u8 {
+    let pl = pool();
+    let total: usize = pl.free.iter().filter(|s| s.0 != 0).map(|s| s.1).sum();
+    if total < HUGE {
+        return std::ptr::null_mut();
+    }
+    // reserve a 2 MB-aligned address range
+    let raw = unsafe { mmap(std::ptr::null_mut(), len + HUGE, 0, MAP_PRIVATE_ANON, -1, 0) };
+    if raw as isize == -1 {
+        return std::ptr::null_mut();
+    }
+    let base = (raw as usize).div_ceil(HUGE) * HUGE;
+    let head = base - raw as usize;
+    if head > 0 {
+        unsafe { munmap(raw, head) };
+    }
+    let tail = HUGE - head;
+    if tail > 0 {
+        unsafe { munmap((base + len) as *mut u8, tail) };
+    }
+    let mut off = 0usize;
+    while off < len {
+        // largest free block first
+        let mut bi: Option<usize> = None;
+        for (i, s) in pl.free.iter().enumerate() {
+            if s.0 != 0 && bi.is_none_or(|b| pl.free[b].1 < s.1) {
+                bi = Some(i);
+            }
+        }
+        let Some(i) = bi else { break };
+        let (p, sz) = pl.free[i];
+        let take = sz.min(len - off);
+        let r = unsafe { mremap(p as *mut u8, take, take, MREMAP_MAYMOVE | MREMAP_FIXED, (base + off) as *mut u8) };
+        if r as isize == -1 {
+            break;
+        }
+        if take < sz {
+            pl.free[i] = (p + take, sz - take);
+        } else {
+            pl.free[i] = (0, 0);
+        }
+        off += take;
+    }
+    if off < len {
+        // the rest is fresh memory, advised for huge pages like map_huge
+        let r = unsafe { mmap((base + off) as *mut u8, len - off, PROT_RW, MAP_PRIVATE_ANON | MAP_FIXED, -1, 0) };
+        if r as isize == -1 {
+            unsafe { munmap(base as *mut u8, len) };
+            return std::ptr::null_mut();
+        }
+        unsafe { madvise((base + off) as *mut u8, len - off, MADV_HUGEPAGE) };
+    }
+    base as *mut u8
 }
 const PROT_RW: i32 = 0x1 | 0x2;
 const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
@@ -96,6 +160,20 @@ unsafe impl GlobalAlloc for Recycler {
                 pl.free[i] = (0, 0);
                 unlock();
                 return p as *mut u8;
+            }
+        }
+        if !REMAP_INIT.swap(true, Ordering::Relaxed) {
+            REMAP_OFF.store(std::env::var_os("REMAP_OFF").is_some(), Ordering::Relaxed);
+        }
+        if !REMAP_OFF.load(Ordering::Relaxed) {
+            let len = layout.size().div_ceil(HUGE) * HUGE;
+            let p = unsafe { gather(len) };
+            if !p.is_null() {
+                if track_live(p as usize, len) {
+                    unlock();
+                    return p;
+                }
+                unsafe { munmap(p, len) };
             }
         }
         let (p, sz) = unsafe { map_huge(layout.size()) };
