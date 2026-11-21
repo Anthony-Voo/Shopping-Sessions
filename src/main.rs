@@ -1936,10 +1936,10 @@ type UEv = PEv;
 
 #[derive(Clone, Copy)]
 #[repr(C, packed(4))]
-struct UCl { // 36 bytes, no padding
+struct UCl { // 28 bytes, no padding
     uh: u64,
-    uref: u64, // user_id: pointer | length << 48
-    cref: u64, // click_id: pointer | length << 48
+    uref: u32, // user_id: click-chunk << 22 | offset in that chunk (CREF_*)
+    cref: u32, // click_id: same encoding
     uh2: u32,
     ts: u32, // ts - (window_start - 7 days)
     camp: u32,
@@ -1982,10 +1982,25 @@ struct PR { // 14 bytes, no padding
 /// Click after person resolution: key = person id << 32 | (ts - (window_start - 7 days)).
 #[derive(Clone, Copy)]
 #[repr(C, packed(4))]
-struct CR { // 20 bytes, no padding
+struct CR { // 16 bytes, no padding
     key: u64,
-    cref: u64, // click_id reference (pack_ref)
+    cref: u32, // click_id: click-chunk << 22 | offset (CREF_*)
     camp: u32,
+}
+
+/// Click field references: click chunks are 3.5 MB (< 4 MB = 2^22), so a chunk index (10 bits)
+/// and an offset (22 bits) fit in a u32.
+const CREF_OFF_BITS: u32 = 22;
+const CREF_OFF_MASK: u32 = (1 << CREF_OFF_BITS) - 1;
+
+/// Bytes of a click-line field from its reference: the field ends at its closing quote if the
+/// byte before it is a quote, else at the next comma (click_id and user_id are never last).
+fn cref_name(chunks: &[B], r: u32) -> B {
+    let c = chunks[(r >> CREF_OFF_BITS) as usize];
+    let p = c.as_ptr() as usize + (r & CREF_OFF_MASK) as usize;
+    match name_of_ref(NameRef::Scan(p)) {
+        b => b,
+    }
 }
 
 #[inline]
@@ -2964,10 +2979,13 @@ last,b,c,d,e,f,g"#
     // ~3.5 MB click chunks: their records (64 B per ~46 B line) fit inside the freed per-chunk
     // event-payload blocks, which the recycling allocator then reuses instead of fresh memory
     let cl_chunks = chunks_of(&cl_bufs, 7 << 19);
+    assert!(cl_chunks.len() < (1 << (32 - CREF_OFF_BITS)) && cl_chunks.iter().all(|c| c.len() <= CREF_OFF_MASK as usize), "click chunk references do not fit 32 bits");
     let per_chunk: Vec<(Vec<UCl>, Vec<u32>)> = cl_chunks
         .par_iter()
-        .map(|&c| {
+        .enumerate()
+        .map(|(cci, &c)| {
             let mut sh: Vec<UCl> = Vec::with_capacity(c.len() / 40 + 16);
+            let cbase = c.as_ptr() as usize;
             let mut cc = vec![0u32; NSH];
             let mut mc = MonthCache::new();
             scan_lines3::<4>(c, |r| {
@@ -2979,7 +2997,8 @@ last,b,c,d,e,f,g"#
                 }
                 let (uh, uh2) = h12(uid);
                 cc[shard_h(uh)] += 1;
-                sh.push(UCl { uh, uref: pack_ref(uid), cref: pack_ref(cid), uh2: uh2 as u32, ts: (ts - (ws - WEEK)) as u32, camp });
+                let cr = |f: B| ((cci as u32) << CREF_OFF_BITS) | (f.as_ptr() as usize - cbase) as u32;
+                sh.push(UCl { uh, uref: cr(uid), cref: cr(cid), uh2: uh2 as u32, ts: (ts - (ws - WEEK)) as u32, camp });
             });
             (sh, cc)
         })
@@ -3067,7 +3086,7 @@ last,b,c,d,e,f,g"#
             let crs: Vec<CR> = cls
                 .iter()
                 .map(|c| CR {
-                    key: ((pid_of(NameRef::Packed(c.uref), c.uh, c.uh2 as u64) as u64) << 32) | c.ts as u64,
+                    key: ((pid_of(NameRef::Scan(cl_chunks[(c.uref >> CREF_OFF_BITS) as usize].as_ptr() as usize + (c.uref & CREF_OFF_MASK) as usize), c.uh, c.uh2 as u64) as u64) << 32) | c.ts as u64,
                     camp: c.camp,
                     cref: c.cref,
                 })
@@ -3154,7 +3173,7 @@ last,b,c,d,e,f,g"#
     let mut results: Vec<(Vec<URow>, Vec<CampAcc>)> = work
         .into_par_iter()
         .with_max_len(1)
-        .map(|(sh, (evs, cls))| {
+        .map(|(sh, (evin, cls))| {
             let mut urows: Vec<URow> = Vec::new();
             let ti = rayon::current_thread_index().unwrap_or(0) % nthreads;
             let mut guard = accs[ti].lock().unwrap();
@@ -3168,17 +3187,17 @@ last,b,c,d,e,f,g"#
             let np = roots_by_shard[sh].len() + unl_names_by_shard[sh].len();
             let li = |key: u64| -> usize { ((key >> 32) as u32 - base) as usize };
             let mut eoff = vec![0u32; np + 1];
-            for r in evs.iter() {
+            for r in evin.iter() {
                 eoff[li(r.key) + 1] += 1;
             }
             for p in 0..np {
                 eoff[p + 1] += eoff[p];
             }
-            let mut eg: Vec<PR> = Vec::with_capacity(evs.len());
+            let mut eg: Vec<PR> = Vec::with_capacity(evin.len());
             let mut pos = eoff.clone();
-            // SAFETY: every slot in 0..evs.len() is written exactly once below
-            unsafe { eg.set_len(evs.len()) };
-            for r in evs.iter() {
+            // SAFETY: every slot in 0..evin.len() is written exactly once below
+            unsafe { eg.set_len(evin.len()) };
+            for r in evin.iter() {
                 let l = li(r.key);
                 eg[pos[l] as usize] = *r;
                 pos[l] += 1;
@@ -3206,19 +3225,53 @@ last,b,c,d,e,f,g"#
             let mut acnt: Vec<u32> = vec![0; ncamp];
             let mut apos: Vec<u32> = vec![0; ncamp];
             let mut alist: Vec<u32> = Vec::new();
+            let mut skeys: Vec<u64> = Vec::new();
             for p in 0..np {
                 if eoff[p] == eoff[p + 1] {
                     continue; // no events: this person has no sessions
                 }
-                let evs = &mut eg[eoff[p] as usize..eoff[p + 1] as usize];
-                evs.sort_unstable_by_key(|r| r.key);
-                let pcl = &mut cg[coff[p] as usize..coff[p + 1] as usize];
+                // sort u64 keys (ts << 32 | index) instead of 14-byte packed records (the small-sort
+                // networks only apply to plain integers), then gather into the free input buffer
+                let (e0, e1) = (eoff[p] as usize, eoff[p + 1] as usize);
+                let grp = &eg[e0..e1];
+                skeys.clear();
+                skeys.extend(grp.iter().enumerate().map(|(i, r)| (r.key << 32) | i as u64));
+                skeys.sort_unstable();
+                let evs = &mut evin[e0..e1];
+                for (d, &k) in evs.iter_mut().zip(skeys.iter()) {
+                    *d = grp[(k & 0xFFFF_FFFF) as usize];
+                }
+                let evs = &*evs;
                 // by ts ascending; equal ts ordered by click_id DESCENDING so the last eligible
-                // click is the winner (latest ts, then smallest click_id)
-                pcl.sort_unstable_by(|x, y| {
-                    let (xk, yk) = (x.key, y.key); // copies: packed fields cannot be borrowed
-                    xk.cmp(&yk).then_with(|| unpack_ref(y.cref).cmp(unpack_ref(x.cref)))
-                });
+                // click is the winner (latest ts, then smallest click_id). Sort u64 keys
+                // (ts << 32 | index), gather into the free input buffer, then fix equal-ts runs.
+                let (c0, c1) = (coff[p] as usize, coff[p + 1] as usize);
+                let cgrp = &cg[c0..c1];
+                skeys.clear();
+                skeys.extend(cgrp.iter().enumerate().map(|(i, r)| (r.key << 32) | i as u64));
+                skeys.sort_unstable();
+                let pcl = &mut cls[c0..c1];
+                let mut eq = false;
+                let mut pk = u64::MAX;
+                for (d, &k) in pcl.iter_mut().zip(skeys.iter()) {
+                    eq |= k >> 32 == pk;
+                    pk = k >> 32;
+                    *d = cgrp[(k & 0xFFFF_FFFF) as usize];
+                }
+                if eq {
+                    let mut a = 0;
+                    while a < pcl.len() {
+                        let ka = pcl[a].key;
+                        let mut b = a + 1;
+                        while b < pcl.len() && pcl[b].key == ka {
+                            b += 1;
+                        }
+                        if b - a > 1 {
+                            pcl[a..b].sort_unstable_by(|x, y| cref_name(&cl_chunks, y.cref).cmp(cref_name(&cl_chunks, x.cref)));
+                        }
+                        a = b;
+                    }
+                }
                 let pcl = &*pcl;
                 let pid = base + p as u32;
                 let (i, j) = (0usize, evs.len());
