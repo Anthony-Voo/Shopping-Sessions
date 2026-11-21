@@ -1092,8 +1092,13 @@ fn parse_event_chunk5(
                 match parse_price(field(6)) {
                     Some(v) => {
                         p = v as u32;
-                        cat = match products.get(pid.unwrap()) {
-                            Some(&c) => c as u16,
+                        let pidb = pid.unwrap();
+                        let c = match PRODTAB.get() {
+                            Some(Some(t)) if t.src == products as *const _ as usize => t.get(pidb),
+                            _ => products.get(pidb).copied(),
+                        };
+                        cat = match c {
+                            Some(c) => c as u16,
                             None => u16::MAX,
                         };
                     }
@@ -1298,8 +1303,13 @@ fn parse5_stage<const S: u8>(
                 match parse_price(field(6)) {
                     Some(v) => {
                         p = v as u32;
-                        cat = match products.get(pid.unwrap()) {
-                            Some(&c) => c as u16,
+                        let pidb = pid.unwrap();
+                        let c = match PRODTAB.get() {
+                            Some(Some(t)) if t.src == products as *const _ as usize => t.get(pidb),
+                            _ => products.get(pidb).copied(),
+                        };
+                        cat = match c {
+                            Some(c) => c as u16,
                             None => u16::MAX,
                         };
                     }
@@ -1829,7 +1839,8 @@ struct DKey {
 type UEv = PEv;
 
 #[derive(Clone, Copy)]
-struct UCl {
+#[repr(C, packed(4))]
+struct UCl { // 36 bytes, no padding
     uh: u64,
     uref: u64, // user_id: pointer | length << 48
     cref: u64, // click_id: pointer | length << 48
@@ -1880,7 +1891,8 @@ struct PR {
 
 /// Click after person resolution: key = person id << 32 | (ts - (window_start - 7 days)).
 #[derive(Clone, Copy)]
-struct CR {
+#[repr(C, packed(4))]
+struct CR { // 20 bytes, no padding
     key: u64,
     cref: u64, // click_id reference (pack_ref)
     camp: u32,
@@ -1945,6 +1957,54 @@ fn partition_counted<T: Copy + Send + Sync>(
 
 /// Like partition_counted; the output's allocation is at least `min_bytes` so that a later
 /// stage can reuse the same (already faulted-in) block through the recycling allocator.
+/// Product id -> category index, keyed by the id's 96-bit hash (h64 + low 32 bits of h2, the
+/// identity used for users and events): one 16-byte slot per probe and no byte comparison.
+/// Built once from the exact product map; a 96-bit clash leaves it unset (exact map used).
+struct ProdTab {
+    slots: Vec<(u64, u32, u32)>, // (h64, h2 low, category + 1); 0 in the last field = empty
+    mask: usize,
+    src: usize, // address of the exact map it mirrors: used only for lookups in that map
+}
+static PRODTAB: std::sync::OnceLock<Option<ProdTab>> = std::sync::OnceLock::new();
+
+impl ProdTab {
+    fn build(products: &FxHashMap<B, u32>) -> Option<ProdTab> {
+        let cap = (products.len() * 2).max(64).next_power_of_two();
+        let mut t = ProdTab { slots: vec![(0, 0, 0); cap], mask: cap - 1, src: products as *const _ as usize };
+        for (&k, &c) in products.iter() {
+            let (h, h2v) = h12(k);
+            let mut i = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & t.mask;
+            loop {
+                let sl = t.slots[i];
+                if sl.2 == 0 {
+                    t.slots[i] = (h, h2v as u32, c + 1);
+                    break;
+                }
+                if sl.0 == h && sl.1 == h2v as u32 {
+                    return None; // two product ids share 96 bits: keep the exact map
+                }
+                i = (i + 1) & t.mask;
+            }
+        }
+        Some(t)
+    }
+    #[inline(always)]
+    fn get(&self, k: &[u8]) -> Option<u32> {
+        let (h, h2v) = h12(k);
+        let mut i = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & self.mask;
+        loop {
+            let sl = self.slots[i];
+            if sl.2 == 0 {
+                return None;
+            }
+            if sl.0 == h && sl.1 == h2v as u32 {
+                return Some(sl.2 - 1);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 /// Parallel bit extract over 128 bits (BMI2 pext on each half).
 #[inline(always)]
 fn pext128(x: u128, m: u128) -> u128 {
@@ -2182,6 +2242,7 @@ fn main() {
         products.insert(pid, ci);
     }
     assert!(cat_names.len() < u16::MAX as usize, "more than 65534 product categories");
+    let _ = PRODTAB.set(if std::env::var_os("PRODTAB_OFF").is_some() { None } else { ProdTab::build(&products) });
     let mut camp_ids: Vec<B> = vec![];
     let mut camp_chan: Vec<B> = vec![];
     let mut campaigns: FxHashMap<B, u32> = FxHashMap::default();
@@ -2518,6 +2579,22 @@ last,b,c,d,e,f,g"#
             .enumerate()
             .map(|(i, (p, _))| (p, i as u32 % 7))
             .collect();
+        // the hash-keyed product table answers exactly like the exact map
+        if let Some(pt) = ProdTab::build(&prods) {
+            let mut n = 0u64;
+            for (&k, &v) in prods.iter() {
+                assert_eq!(pt.get(k), Some(v), "product table mismatch on {:?}", String::from_utf8_lossy(k));
+                let mut m = k.to_vec();
+                let i = (rnd() as usize) % m.len();
+                m[i] = m[i].wrapping_add(1 + (rnd() % 200) as u8);
+                if rnd() % 3 == 0 {
+                    m.push(b'0' + (rnd() % 10) as u8);
+                }
+                assert_eq!(pt.get(&m), prods.get(&m[..]).copied(), "product table mismatch on {:?}", String::from_utf8_lossy(&m));
+                n += 2;
+            }
+            eprintln!("SELFTEST ok: product table identical on {n} lookups");
+        }
         let mut cks = 0u64;
         for (ci, c) in chunks(&ev_bufs).into_iter().chain([synth]).enumerate() {
             for cut in [c.len(), c.len().saturating_sub(1), c.len().saturating_sub(29)] {
@@ -3013,7 +3090,10 @@ last,b,c,d,e,f,g"#
                 let pcl = &mut cg[coff[p] as usize..coff[p + 1] as usize];
                 // by ts ascending; equal ts ordered by click_id DESCENDING so the last eligible
                 // click is the winner (latest ts, then smallest click_id)
-                pcl.sort_unstable_by(|x, y| x.key.cmp(&y.key).then_with(|| unpack_ref(y.cref).cmp(unpack_ref(x.cref))));
+                pcl.sort_unstable_by(|x, y| {
+                    let (xk, yk) = (x.key, y.key); // copies: packed fields cannot be borrowed
+                    xk.cmp(&yk).then_with(|| unpack_ref(y.cref).cmp(unpack_ref(x.cref)))
+                });
                 let pcl = &*pcl;
                 let pid = base + p as u32;
                 let (i, j) = (0usize, evs.len());
