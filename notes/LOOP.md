@@ -220,3 +220,4 @@ USER DIRECTION (Nov 21 ~16:00 UTC): stop creating new designs/experiments; keep 
 | R2 | refine best: CHUNK 32 -> 16 MB (24 runs) | wall 1.394 / cpu 5.168 | 1.412 (10/24) / 5.332 (9/24) | not better: unchanged |
 | R3 | refine best: write-combining burst 384 -> 512 B (24 runs) | wall 1.284 / cpu 4.738 | 1.333 (7/24) / 4.902 (7/24) | worse: unchanged |
 | R4 | refine best: write-combining burst 384 -> 256 B (24 runs) | wall 1.371 / cpu 5.103 | 1.400 (10/24) / 5.169 (10/24) | not better: 384 B stays (both neighbours lose) |
+| R5 | refine best: links interner prefetch AHEAD 12 -> 24 / 48 (links thread, NCPU=1, 3 runs each at 20M and 60M) | 12: 0.263-0.267 / 0.70-0.88 s | 24: 0.235-0.284 / 0.70-0.78; 48: 0.209-0.295 / 0.76-0.88 | within noise: unchanged |
