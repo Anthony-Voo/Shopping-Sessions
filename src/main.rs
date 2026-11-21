@@ -2366,6 +2366,84 @@ fn partition_sized<T: Copy + Send + Sync>(
     (out, off)
 }
 
+/// partition_sized with known counts whose output elements are built per input element:
+/// `map(part, index, element)` returns (shard, output value). Same write-combining scatter.
+fn partition_map<S: Sync, T: Copy + Send + Sync>(
+    parts: &[&[S]],
+    known: Vec<Vec<u32>>,
+    map: impl Fn(usize, usize, &S) -> (usize, T) + Sync,
+) -> (Vec<T>, Vec<usize>) {
+    let counts: Vec<Vec<usize>> = known.into_iter().map(|v| v.into_iter().map(|x| x as usize).collect()).collect();
+    let mut starts: Vec<Vec<usize>> = vec![vec![0; NSH]; parts.len()];
+    let mut off = vec![0usize; NSH + 1];
+    let mut run = 0;
+    for sh in 0..NSH {
+        off[sh] = run;
+        for c in 0..parts.len() {
+            starts[c][sh] = run;
+            run += counts[c][sh];
+        }
+    }
+    off[NSH] = run;
+    let mut out: Vec<T> = Vec::with_capacity(run);
+    let ptr = SendPtr(out.as_mut_ptr());
+    let ptr = &ptr;
+    // software write-combining: stage each shard's elements in a ~256 B buffer (all buffers
+    // together ~256 KB, L2-resident) and flush full buffers as one contiguous burst, so the
+    // 1024-way scatter costs one TLB/cache miss per burst instead of one per element
+    // burst = smallest whole number of 64 B lines (>= 192 B) holding whole elements, fixed at
+    // compile time, so each flush is a few inline 64 B vector moves rather than a memcpy call
+    let e: usize = const {
+        let sz = std::mem::size_of::<T>();
+        assert!(sz > 0);
+        let (mut a, mut b) = (sz, 64usize);
+        while b != 0 {
+            let t = a % b;
+            a = b;
+            b = t;
+        }
+        let base = 64 / a;
+        let mut n = base;
+        while n * sz < 384 {
+            n += base;
+        }
+        n
+    };
+    let lines: usize = const { 0 } + e * std::mem::size_of::<T>() / 64;
+    parts.par_iter().zip(starts.into_par_iter()).enumerate().for_each_init(
+        || (Vec::<T>::with_capacity(NSH * e), vec![0u16; NSH]),
+        |(buf, fill), (pi, (v, mut pos))| {
+            let bp = buf.as_mut_ptr();
+            for (i, x) in v.iter().enumerate() {
+                let (k, y) = map(pi, i, x);
+                let f = fill[k] as usize;
+                // SAFETY: k*e + f < NSH*e = buf capacity (T: Copy, slots are only read after a write)
+                unsafe { bp.add(k * e + f).write(y) };
+                if f + 1 == e {
+                    // SAFETY: each (chunk, shard) owns the disjoint range [starts, starts+count)
+                    unsafe { copy_lines(bp.add(k * e) as *const u8, ptr.0.add(pos[k]) as *mut u8, lines) };
+                    pos[k] += e;
+                    fill[k] = 0;
+                } else {
+                    fill[k] = (f + 1) as u16;
+                }
+            }
+            for k in 0..NSH {
+                let f = fill[k] as usize;
+                if f > 0 {
+                    // SAFETY: as above; the tail fits the shard's remaining range
+                    unsafe { std::ptr::copy_nonoverlapping(bp.add(k * e), ptr.0.add(pos[k]), f) };
+                    pos[k] += f;
+                    fill[k] = 0;
+                }
+            }
+        },
+    );
+    // SAFETY: all `run` slots were written above
+    unsafe { out.set_len(run) };
+    (out, off)
+}
+
 /// Split a partitioned array into disjoint mutable shard slices.
 fn shard_slices<'a, T>(mut all: &'a mut [T], off: &[usize]) -> Vec<&'a mut [T]> {
     let mut v = Vec::with_capacity(NSH);
@@ -2476,15 +2554,14 @@ fn main() {
     let links_job = std::thread::spawn(move || {
     let lt0 = Instant::now();
     // links: union-find, root kept as byte-wise smallest ID
-    let pairs: Vec<(B, B)> = chunks(&ln_bufs2)
-        .iter()
-        .flat_map(|&c| {
-            lines(c).filter_map(|l| match fields::<2>(l) {
-                Some([Some(a), Some(b)]) => Some((a, b)),
-                _ => None,
-            })
-        })
-        .collect();
+    let mut pairs: Vec<(B, B)> = Vec::new();
+    for &c in chunks(&ln_bufs2).iter() {
+        scan_lines3::<2>(c, |r| {
+            if let Some([Some(a), Some(b)]) = r {
+                pairs.push((a, b));
+            }
+        });
+    }
     // intern link IDs by 64-bit hash; if two different IDs ever share a hash, switch to exact string interning
     struct Intern {
         ih: FxHashMap<u64, u32>,
@@ -2578,6 +2655,15 @@ fn main() {
         })
         .collect();
     let mut h2s: Vec<u32> = Vec::new(); // low 32 bits of h2 per interned ID (fast path only)
+    // first 8 bytes of each interned ID, big-endian and zero-padded: orders IDs byte-wise
+    // whenever two prefixes differ, without chasing the name pointers (equal -> full compare)
+    let mut pfx: Vec<u64> = Vec::new();
+    let pfx_of = |n: B| -> u64 {
+        let mut w = [0u8; 8];
+        let k = n.len().min(8);
+        w[..k].copy_from_slice(&n[..k]);
+        u64::from_be_bytes(w)
+    };
     let mut fast_ok = true;
     {
         let cap = (pairs.len() * 2).max(1024).next_power_of_two(); // <= ~60% full (ids <= 2x pairs, usually ~1.35x)
@@ -2617,6 +2703,7 @@ fn main() {
                     if t.k == 0 {
                         let id = it.new_id(name, h);
                         h2s.push(h2v);
+                        pfx.push(pfx_of(name));
                         tab[p] = ISlot { k: h, id, h2: h2v };
                         ids[j] = id;
                         break;
@@ -2626,12 +2713,15 @@ fn main() {
             }
             let (ra, rb) = (it.find(ids[0]), it.find(ids[1]));
             if ra != rb {
-                let (lo, hi) = if it.names[ra as usize] <= it.names[rb as usize] { (ra, rb) } else { (rb, ra) };
+                let (pa, pb) = (pfx[ra as usize], pfx[rb as usize]);
+                let a_first = if pa != pb { pa < pb } else { it.names[ra as usize] <= it.names[rb as usize] };
+                let (lo, hi) = if a_first { (ra, rb) } else { (rb, ra) };
                 it.parent[hi as usize] = lo;
             }
         }
     }
     drop(hs);
+    drop(pfx);
     if !fast_ok || std::env::var_os("LINKS_EXACT").is_some() {
         // exact path (also selectable with LINKS_EXACT for tests): start over
         h2s.clear();
@@ -3103,16 +3193,13 @@ last,b,c,d,e,f,g"#
     // All shards' person records go into two buffers sized up front (one PR per winner, one CR
     // per click), so they come from the huge-page recycling allocator instead of 256 fresh
     // per-shard vectors faulted in 4 KB pages; the lookup tables are reused per thread.
-    let mut prs_all: Vec<PR> = Vec::with_capacity(uev_all.len());
-    let mut crs_all: Vec<CR> = Vec::with_capacity(ucl_all.len());
-    // SAFETY: every slot is written exactly once below (shard slices cover the buffers)
-    unsafe {
-        prs_all.set_len(uev_all.len());
-        crs_all.set_len(ucl_all.len());
-    }
-    let prs_slices = shard_slices(&mut prs_all, &uev_off);
-    let crs_slices = shard_slices(&mut crs_all, &ucl_off);
-    let jobs: Vec<(usize, (&mut [PR], &mut [CR]))> = prs_slices.into_iter().zip(crs_slices).enumerate().collect();
+    // resolve writes only each record's person id; the person partition below builds the PR/CR
+    // records straight from (user-shard record, pid) in person-shard order (no PR/CR copy)
+    let mut epid_all: Vec<u32> = vec![0; uev_all.len()];
+    let mut cpid_all: Vec<u32> = vec![0; ucl_all.len()];
+    let prs_slices = shard_slices(&mut epid_all, &uev_off);
+    let crs_slices = shard_slices(&mut cpid_all, &ucl_off);
+    let jobs: Vec<(usize, (&mut [u32], &mut [u32]))> = prs_slices.into_iter().zip(crs_slices).enumerate().collect();
     let resolved: Vec<(Vec<B>, Vec<u32>, Vec<u32>)> = jobs
         .into_par_iter()
         .map_init(
@@ -3181,7 +3268,7 @@ last,b,c,d,e,f,g"#
                 for (e, d) in evs[pos..pos + n].iter().zip(prs_out[pos..pos + n].iter_mut()) {
                     let pid = pid_of(NameRef::Scan(base + e.uoff as usize), e.pk, e.pk2 as u64);
                     pc[(pid >> PL_BITS) as usize] += 1;
-                    *d = PR { key: ((pid as u64) << 32) | e.ts as u64, price: e.price, cat: e.cat };
+                    *d = pid;
                 }
                 pos += n;
             }
@@ -3191,13 +3278,11 @@ last,b,c,d,e,f,g"#
             for (c, d) in cls.iter().zip(crs_out.iter_mut()) {
                 let pid = pid_of(NameRef::Scan(cl_chunks[(c.uref >> CREF_OFF_BITS) as usize].as_ptr() as usize + (c.uref & CREF_OFF_MASK) as usize), c.uh, c.uh2 as u64);
                 cc[(pid >> PL_BITS) as usize] += 1;
-                *d = CR { key: ((pid as u64) << 32) | c.ts as u64, camp: c.camp, cref: c.cref };
+                *d = pid;
             }
             (unl_names, pc, cc)
         })
         .collect();
-    drop(uev_all);
-    drop(ucl_all);
     let mut unl_names_by_shard: Vec<Vec<B>> = Vec::with_capacity(NSH);
     let mut pcs = Vec::with_capacity(NSH);
     let mut ccs = Vec::with_capacity(NSH);
@@ -3206,20 +3291,28 @@ last,b,c,d,e,f,g"#
         pcs.push(d);
         ccs.push(e);
     }
-    let prs_parts: Vec<&[PR]> = (0..NSH).map(|sh| &prs_all[uev_off[sh]..uev_off[sh + 1]]).collect();
-    let crs_parts: Vec<&[CR]> = (0..NSH).map(|sh| &crs_all[ucl_off[sh]..ucl_off[sh + 1]]).collect();
+    let uev_parts: Vec<&[UEv]> = (0..NSH).map(|sh| &uev_all[uev_off[sh]..uev_off[sh + 1]]).collect();
+    let ucl_parts: Vec<&[UCl]> = (0..NSH).map(|sh| &ucl_all[ucl_off[sh]..ucl_off[sh + 1]]).collect();
     // person ids are final (shard << PL_BITS | index): partition straight by their shard
     let name_of_pid = |pid: u32| -> B {
         let (sh, l) = ((pid >> PL_BITS) as usize, (pid & PL_MASK) as usize);
         let roots = &roots_by_shard[sh];
         if l < roots.len() { roots[l] } else { unl_names_by_shard[sh][l - roots.len()] }
     };
-    let (mut pev_all, pev_off) = partition_counted(&prs_parts, Some(pcs), |_, _| true, |r: &PR| (r.key >> (32 + PL_BITS)) as usize);
-    drop(prs_parts);
-    drop(prs_all);
-    let (mut pcl_all, pcl_off) = partition_counted(&crs_parts, Some(ccs), |_, _| true, |c: &CR| (c.key >> (32 + PL_BITS)) as usize);
-    drop(crs_parts);
-    drop(crs_all);
+    let (mut pev_all, pev_off) = partition_map(&uev_parts, pcs, |pi, i, e: &UEv| {
+        let pid = epid_all[uev_off[pi] + i];
+        ((pid >> PL_BITS) as usize, PR { key: ((pid as u64) << 32) | e.ts as u64, price: e.price, cat: e.cat })
+    });
+    drop(uev_parts);
+    drop(uev_all);
+    drop(epid_all);
+    let (mut pcl_all, pcl_off) = partition_map(&ucl_parts, ccs, |pi, i, c: &UCl| {
+        let pid = cpid_all[ucl_off[pi] + i];
+        ((pid >> PL_BITS) as usize, CR { key: ((pid as u64) << 32) | c.ts as u64, camp: c.camp, cref: c.cref })
+    });
+    drop(ucl_parts);
+    drop(ucl_all);
+    drop(cpid_all);
     lap("events regrouped");
     // per person-shard: sessionize, attribute, aggregate
     // 40-byte output row (was 56): counts fit u32 (at most the event count); NO_TOP = no purchase
@@ -3548,8 +3641,9 @@ last,b,c,d,e,f,g"#
             &[
                 ("user_id", pq::Col::Str(rows.iter().map(|r| Some(r.name)).collect(), false)),
                 ("day", pq::Col::Date(rows.iter().map(|r| r.day).collect())),
-                ("sessions", pq::Col::I64(rows.iter().map(|r| r.sessions as i64).collect())),
-                ("events", pq::Col::I64(rows.iter().map(|r| r.events as i64).collect())),
+                // counts are at most the number of events (< 2^31): 32-bit columns, 8 bytes less per row
+                ("sessions", pq::Col::I32(rows.iter().map(|r| r.sessions as i32).collect())),
+                ("events", pq::Col::I32(rows.iter().map(|r| r.events as i32).collect())),
                 ("revenue_cents", pq::Col::I64(rows.iter().map(|r| r.revenue).collect())),
                 ("top_category", pq::Col::Str(rows.iter().map(|r| if r.top == NO_TOP { None } else { Some(cat_name(r.top)) }).collect(), true)),
             ],

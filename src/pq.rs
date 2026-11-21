@@ -9,6 +9,8 @@ pub enum Col<'a> {
     Str(Vec<Option<&'a [u8]>>, bool /* optional */),
     Date(Vec<i32>),
     I64(Vec<i64>),
+    /// plain INT32 (the rules accept any integer width)
+    I32(Vec<i32>),
 }
 
 // ---- Thrift compact protocol
@@ -106,6 +108,7 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
         Col::Str(v, _) => v.len(),
         Col::Date(v) => v.len(),
         Col::I64(v) => v.len(),
+        Col::I32(v) => v.len(),
     };
     let mut f = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
     f.write_all(b"PAR1")?;
@@ -136,6 +139,12 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
             }
             Col::I64(v) => {
                 ty = 2; // INT64
+                for x in v {
+                    page.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            Col::I32(v) => {
+                ty = 1; // INT32
                 for x in v {
                     page.extend_from_slice(&x.to_le_bytes());
                 }
@@ -172,6 +181,7 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
             Col::Str(_, o) => (6, *o),
             Col::Date(_) => (1, false),
             Col::I64(_) => (2, false),
+            Col::I32(_) => (1, false),
         };
         m.i32(1, ty);
         m.i32(3, if opt { 1 } else { 0 });
@@ -191,7 +201,7 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
                 m.end();
                 m.end();
             }
-            Col::I64(_) => {}
+            Col::I64(_) | Col::I32(_) => {}
         }
         m.end();
     }
