@@ -1883,10 +1883,11 @@ impl PEv {
 
 /// Event after person resolution: key = person id << 32 | (ts - window_start).
 #[derive(Clone, Copy)]
-struct PR {
+#[repr(C, packed(2))]
+struct PR { // 14 bytes, no padding
     key: u64,
     price: u32, // > 0 exactly for purchases
-    cat: u32,
+    cat: u16,   // category index; u16::MAX = unknown product (categories are < 65535)
 }
 
 /// Click after person resolution: key = person id << 32 | (ts - (window_start - 7 days)).
@@ -2916,7 +2917,7 @@ last,b,c,d,e,f,g"#
                 .map(|e| PR {
                     key: ((pid_of(e.name(), e.pk, e.pk2 as u64) as u64) << 32) | e.ts as u64,
                     price: e.price,
-                    cat: if e.cat == u16::MAX { UNKNOWN_CAT } else { e.cat as u32 },
+                    cat: e.cat,
                 })
                 .collect();
             let cls = &ucl_all[ucl_off[shi]..ucl_off[shi + 1]];
@@ -3142,9 +3143,10 @@ last,b,c,d,e,f,g"#
                     r.revenue += rev;
                     for x in &evs[k..e] {
                         if x.price > 0 {
-                            match cats.iter_mut().find(|c| c.0 == x.cat) {
+                            let xc = if x.cat == u16::MAX { UNKNOWN_CAT } else { x.cat as u32 };
+                            match cats.iter_mut().find(|c| c.0 == xc) {
                                 Some(c) => c.1 += x.price as i64,
-                                None => cats.push((x.cat, x.price as i64)),
+                                None => cats.push((xc, x.price as i64)),
                             }
                         }
                     }
