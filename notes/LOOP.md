@@ -247,3 +247,4 @@ USER DIRECTION (Nov 21 ~16:00 UTC): stop creating new designs/experiments; keep 
 PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried on the parser: sliding mask window, pdep comma positions, AES hash, event-ts month cache, ingest no-revalidation, raw-pointer pushes, lazy fields, ws hoist, PF_DIST 1k-8k, CHUNK 16 MB, 512-bit autovectorization: all ties or losses.
 | R25 | parse: test the F1 timestamp shape first (58% of lines), F3/F2 after | 63.5-67.3 ns/line (6 rounds) | 63.3-67.0 (3/6) | tie: reverted (exact: gate, SELFTEST) |
 | R26 | parse: branch-free event_kind (one masked 8-byte load, cmov select) | 62.6-66.5 ns/line (6 rounds) | 63.1-68.2 (1/6) | slower: reverted (exact: gate + seed 226) |
+| R27 | parse: drop the legacy per-line uid len/ptr assert (uoff is chunk-relative, chunk < 2^31 asserted) | 62.4-69.1 ns/line (6 rounds) | 62.6-66.9 (2/6) | tie (predictable branch): reverted (exact: gate + seed 227) |
