@@ -188,3 +188,5 @@ Note: docker works here (start dockerd; base images from local shopping-sessions
 | diag | links thread uncontended (NCPU=1): parse 0.045, hash 0.015, intern+union-find 0.133, rootv 0.012, roots 0.016, lks 0.04 = 0.26 s CPU | — | — | — |
 | G21 | links: fast line scanner + 8-byte big-endian name prefixes for the union-find order (equal prefixes -> full compare) | links thread 0.272 s | 0.226-0.267 s | exact (gate + seeds 195-196) |
 | stack | G20 + G21 vs v53, 24 runs | wall 1.372 / cpu 5.120 | 1.376 / 5.130 (14/24) | tie: parked (scratchpad/stack_g20_g21.patch), src back to v53 |
+| 60M check | v53 vs v51 at 60M (10 interleaved pairs) | wall 4.170 / cpu 16.04 | 4.165 / 15.95 (6/10, 5/10) | tie at the final's size: v52/v53 gains do not show at 60M either. 60M stage walls: parse 1.65-1.97, key tail 0.23-0.28, dedup 0.25-0.29, clicks 0.49-0.54, regroup 0.38-0.45, sessionize 0.72-0.78, write 0.17-0.21; links thread 1.03 s (concurrent) |
+| G22 | click parse in rayon::join with key partition + dedup (fill barrier tails) | wall 1.370 / cpu 5.086 (16) | 1.466 / 5.373 (5/16) | worse: clicks lose the freed-block reuse (fresh memory) — reverted |
