@@ -198,3 +198,4 @@ Note: docker works here (start dockerd; base images from local shopping-sessions
 | v55 | stack on v54: G20 (INT32 counts) + G21 (links scanner + name prefixes) + G26 (fused resolve partition) | abc 24: wall 1.293 / cpu 4.749 | 1.259 (16/24) / 4.627 (19/24) | KEPT as v55 on dev (exact: gate + seed 206); <5% vs v54 so main stays v54 |
 | G27 | build with -C target-feature=-prefer-256-bit (let LLVM auto-vectorize at 512 bits) | wall 1.417 / cpu 5.204 (16) | 1.406 (7/16) / 5.143 (9/16) | tie: build flags unchanged |
 | G28 | sessionize radix 1 pass on ts>>20 (17-min buckets) + insertion fix | sess 0.246, total 1.357 (16) | 0.346, 1.528 (1/16) | much worse (fix-up cost explodes): reverted; 2 passes on ts>>9 is the sweet spot |
+| G29 | clicks: equal-ts detection folded into the insertion fix-up (one pass less over clicks) | sess 0.245, total 1.434 (16) | 0.241, 1.393 (10/16) | near-tie, exact (gate + seeds 209-210): IN WORKING STACK (scratchpad/g29_eq.patch) |
