@@ -2362,7 +2362,7 @@ fn main() {
     let mut h2s: Vec<u32> = Vec::new(); // low 32 bits of h2 per interned ID (fast path only)
     let mut fast_ok = true;
     {
-        let cap = (pairs.len() * 4).max(1024).next_power_of_two();
+        let cap = (pairs.len() * 2).max(1024).next_power_of_two(); // <= ~60% full (ids <= 2x pairs, usually ~1.35x)
         let mask = cap - 1;
         let mut tab = vec![ISlot { k: 0, id: 0, h2: 0 }; cap];
         let slot_of = |h: u64| (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24) as usize & mask;
@@ -3014,8 +3014,16 @@ last,b,c,d,e,f,g"#
     work.sort_unstable_by_key(|(_, (e, c))| std::cmp::Reverse(e.len() + c.len()));
     // one campaign x day accumulator per thread (reused across its shards), not one per task
     let nthreads = rayon::current_num_threads();
-    let accs: Vec<std::sync::Mutex<Vec<[i64; 4]>>> = (0..nthreads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
-    let mut results: Vec<(Vec<URow>, Vec<[i64; 4]>)> = work
+    // per (campaign, day): revenue + three session counts in 24 bytes (was 4 x i64 = 32)
+    #[derive(Clone, Copy, Default)]
+    struct CampAcc {
+        rev: i64,
+        sessions: u32,
+        purchasing: u32,
+        assisted: u32,
+    }
+    let accs: Vec<std::sync::Mutex<Vec<CampAcc>>> = (0..nthreads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    let mut results: Vec<(Vec<URow>, Vec<CampAcc>)> = work
         .into_par_iter()
         .with_max_len(1)
         .map(|(sh, (evs, cls))| {
@@ -3023,9 +3031,9 @@ last,b,c,d,e,f,g"#
             let ti = rayon::current_thread_index().unwrap_or(0) % nthreads;
             let mut guard = accs[ti].lock().unwrap();
             if guard.is_empty() {
-                *guard = vec![[0i64; 4]; ncamp * ndays];
+                *guard = vec![CampAcc::default(); ncamp * ndays];
             }
-            let camp: &mut Vec<[i64; 4]> = &mut guard;
+            let camp: &mut Vec<CampAcc> = &mut guard;
             // group by person with a counting sort over the shard's contiguous id range, then sort
             // each person's (few) events by time; clicks are grouped the same way
             let base = (sh as u32) << PL_BITS;
@@ -3162,11 +3170,11 @@ last,b,c,d,e,f,g"#
                     }
                     let credit = if hi > lo { pcl[hi - 1].camp } else { ORGANIC };
                     let a = &mut camp[cidx(credit, day)];
-                    a[0] += 1;
-                    a[1] += purch as i64;
-                    a[2] += rev;
+                    a.sessions += 1;
+                    a.purchasing += purch as u32;
+                    a.rev += rev;
                     for &c in &alist {
-                        camp[cidx(c, day)][3] += 1;
+                        camp[cidx(c, day)].assisted += 1;
                     }
                     k = e;
                 }
@@ -3203,9 +3211,10 @@ last,b,c,d,e,f,g"#
     for (u, c) in results {
         user_parts.push(u);
         for (a, v) in dense.iter_mut().zip(c) {
-            for t in 0..4 {
-                a[t] += v[t];
-            }
+            a[0] += v.sessions as i64;
+            a[1] += v.purchasing as i64;
+            a[2] += v.rev;
+            a[3] += v.assisted as i64;
         }
     }
     // a (campaign, day) row exists when it was credited or assisted at least once
