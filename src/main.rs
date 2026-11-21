@@ -2278,13 +2278,98 @@ fn main() {
         clash: false,
         slow: FxHashMap::default(),
     };
-    it.ih.reserve(pairs.len());
-    for &(a, b) in &pairs {
-        let (ia, ib) = (it.id(a), it.id(b));
-        let (ra, rb) = (it.find(ia), it.find(ib));
-        if ra != rb {
-            let (lo, hi) = if it.names[ra as usize] <= it.names[rb as usize] { (ra, rb) } else { (rb, ra) };
-            it.parent[hi as usize] = lo;
+    // Fast interner: flat open-addressing table keyed by h64 with the slots of the pair 12
+    // ahead prefetched (the lookups are cache misses). An ID is identified by h64 + low 32 bits
+    // of h2, the same 96-bit identity the resolve stage uses for users. Any 64-bit clash (or a
+    // zero hash) abandons this path for the exact string interner below.
+    #[derive(Clone, Copy)]
+    struct ISlot {
+        k: u64, // h64; 0 = empty
+        id: u32,
+        h2: u32,
+    }
+    let hs: Vec<(u64, u32, u64, u32)> = pairs
+        .iter()
+        .map(|&(a, b)| {
+            let (ha, ha2) = h12(a);
+            let (hb, hb2) = h12(b);
+            (ha, ha2 as u32, hb, hb2 as u32)
+        })
+        .collect();
+    let mut h2s: Vec<u32> = Vec::new(); // low 32 bits of h2 per interned ID (fast path only)
+    let mut fast_ok = true;
+    {
+        let cap = (pairs.len() * 4).max(1024).next_power_of_two();
+        let mask = cap - 1;
+        let mut tab = vec![ISlot { k: 0, id: 0, h2: 0 }; cap];
+        let slot_of = |h: u64| (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24) as usize & mask;
+        const AHEAD: usize = 12;
+        'pairs: for i in 0..pairs.len() {
+            #[cfg(target_feature = "sse")]
+            if i + AHEAD < pairs.len() {
+                let (pa, _, pb, _) = hs[i + AHEAD];
+                // SAFETY: in-bounds addresses; prefetch has no architectural effect
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch(tab.as_ptr().add(slot_of(pa)) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                    std::arch::x86_64::_mm_prefetch(tab.as_ptr().add(slot_of(pb)) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                }
+            }
+            let (a, b) = pairs[i];
+            let (ha, ha2, hb, hb2) = hs[i];
+            let mut ids = [0u32; 2];
+            for (j, (name, h, h2v)) in [(a, ha, ha2), (b, hb, hb2)].into_iter().enumerate() {
+                if h == 0 {
+                    fast_ok = false;
+                    break 'pairs;
+                }
+                let mut p = slot_of(h);
+                loop {
+                    let t = tab[p];
+                    if t.k == h {
+                        if t.h2 != h2v {
+                            fast_ok = false; // two IDs share a 64-bit hash
+                            break 'pairs;
+                        }
+                        ids[j] = t.id;
+                        break;
+                    }
+                    if t.k == 0 {
+                        let id = it.new_id(name, h);
+                        h2s.push(h2v);
+                        tab[p] = ISlot { k: h, id, h2: h2v };
+                        ids[j] = id;
+                        break;
+                    }
+                    p = (p + 1) & mask;
+                }
+            }
+            let (ra, rb) = (it.find(ids[0]), it.find(ids[1]));
+            if ra != rb {
+                let (lo, hi) = if it.names[ra as usize] <= it.names[rb as usize] { (ra, rb) } else { (rb, ra) };
+                it.parent[hi as usize] = lo;
+            }
+        }
+    }
+    drop(hs);
+    if !fast_ok || std::env::var_os("LINKS_EXACT").is_some() {
+        // exact path (also selectable with LINKS_EXACT for tests): start over
+        h2s.clear();
+        it = Intern {
+            ih: FxHashMap::default(),
+            names: vec![],
+            hashes: vec![],
+            parent: vec![],
+            clash: false,
+            slow: FxHashMap::default(),
+        };
+        it.ih.reserve(pairs.len());
+        for &(a, b) in &pairs {
+            let (ia, ib) = (it.id(a), it.id(b));
+            let (ra, rb) = (it.find(ia), it.find(ib));
+            if ra != rb {
+                let (lo, hi) = if it.names[ra as usize] <= it.names[rb as usize] { (ra, rb) } else { (rb, ra) };
+                it.parent[hi as usize] = lo;
+            }
         }
     }
     let rootv: Vec<u32> = (0..it.names.len() as u32).map(|i| it.find(i)).collect();
@@ -2296,7 +2381,8 @@ fn main() {
     let mut lks: Vec<Vec<(u64, (u64, u32))>> = (0..NSH).map(|_| Vec::new()).collect();
     for (i, &n) in it.names.iter().enumerate() {
         let h = it.hashes[i];
-        lks[shard_h(h)].push((h, (h2(n), rootv[i])));
+        let t2 = if h2s.is_empty() { h2(n) } else { h2s[i] as u64 };
+        lks[shard_h(h)].push((h, (t2, rootv[i])));
     }
         eprintln!("{:>8.3}s   (links thread done after {:.3}s)", t0.elapsed().as_secs_f64(), lt0.elapsed().as_secs_f64());
         (it, rootv, lk_clash, lks)
