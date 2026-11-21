@@ -268,3 +268,7 @@ PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried 
   LLVM (Rust=clang=Zig) loses ~28% to gcc only on naive per-byte loops (extra induction vars in scan loops); clang -fno-vectorize/-fno-unroll/-O2 don't close it.
 - Kernel B (our style: AVX-512 64B separator masks + tzcnt walk + crc hash): gcc 1.65-1.88 s vs clang 1.76-1.89 -> tie.
 - Conclusion: compiler/language is not the gap; our hot code is mask/intrinsic based. MoonBit not installed (no SIMD intrinsics; would be slower). Hand asm: no expected win over intrinsics.
+- Kernel C (sessionize-like: 4-pass 14-bit LSD radix of 20M (uid,ts) u64 + gap scan) and Kernel D (resolve-like: 20M open-addressing lookups, 1.5M users), 1 thread, 3 runs, identical checksums:
+  sort+scan ms: gcc 834-919 | clang 893-979 | Rust 859-953 | Go 862-929 -> tie.
+  hash ms:      gcc 275-293 | clang 273-286 | Rust 288-376 (first run outlier, then 305/288) | Go 276-299 -> tie.
+  Both memory-bound; language irrelevant.
