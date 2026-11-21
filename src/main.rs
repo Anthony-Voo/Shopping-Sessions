@@ -742,7 +742,7 @@ fn parse_event_chunk4(
     ws: i64,
     we: i64,
     products: &FxHashMap<B, u32>,
-) -> (Vec<PEv>, Vec<DKey>, Vec<u32>) {
+) -> (Vec<PEv>, Vec<DKey>, Vec<u32>, Vec<u32>) {
     const NL: u32 = 1 << 31;
     const WIN: usize = 64 << 10;
     let n = chunk.len();
@@ -751,6 +751,7 @@ fn parse_event_chunk4(
     let mut pay: Vec<PEv> = Vec::with_capacity(cap);
     let mut keys: Vec<DKey> = Vec::with_capacity(cap);
     let mut kcount = vec![0u32; NSH];
+    let mut ucount = vec![0u32; NSH]; // valid payloads per user shard
     // a window never holds more separators than bytes: size the index once
     let mut idx: Vec<u32> = Vec::with_capacity(WIN + 1024);
     let mut nlq: Vec<u32> = Vec::with_capacity(WIN + 1024);
@@ -908,6 +909,7 @@ fn parse_event_chunk4(
                 idx = pay.len() as u64;
                 let (uh, uh2) = h12_over(u);
                 ush = shard_h(uh) as u64;
+                ucount[ush as usize] += 1;
                 assert!(u.len() <= 0xFFFF && (u.as_ptr() as u64) < (1 << 48), "user_id reference does not pack");
                 pay.push(PEv {
                     pk: uh,
@@ -927,7 +929,7 @@ fn parse_event_chunk4(
         let _ = pad;
         wstart = wend;
     }
-    (pay, keys, kcount)
+    (pay, keys, kcount, ucount)
 }
 
 
@@ -1947,7 +1949,7 @@ last,b,c,d,e,f,g"#
                 let c: &'static [u8] = &c[..cut];
                 let (a1, b1, k1) = parse_event_chunk(c, ci, ws, we, &prods);
                 let (a3, b3, k3) = parse_event_chunk3(c, ci, ws, we, &prods);
-                let (a4, b4, k4) = parse_event_chunk4(c, ci, ws, we, &prods);
+                let (a4, b4, k4, _) = parse_event_chunk4(c, ci, ws, we, &prods);
                 assert!(
                     a4.len() == a3.len() && b4.len() == b3.len() && k4 == k3
                         && a4.iter().zip(&a3).all(|(x, y)| x.pk == y.pk && x.nref == y.nref && x.pk2 == y.pk2 && x.ts == y.ts && x.price == y.price && x.cat == y.cat)
@@ -2032,7 +2034,7 @@ last,b,c,d,e,f,g"#
         eprintln!("PARSEBENCH level {level}: {n} lines, {:.1} ns/line, {:.2}s (acc {acc})", el * 1e9 / n as f64, el);
         std::process::exit(0);
     }
-    let per_chunk: Vec<(Vec<UEv>, Vec<DKey>, Vec<u32>)> = ev_chunks
+    let per_chunk: Vec<(Vec<UEv>, Vec<DKey>, Vec<u32>, Vec<u32>)> = ev_chunks
         .par_iter()
         .enumerate()
         .map(|(ci, &c)| parse_event_chunk4(c, ci, ws, we, &products))
@@ -2041,10 +2043,12 @@ last,b,c,d,e,f,g"#
     let mut pays: Vec<Vec<UEv>> = Vec::with_capacity(per_chunk.len());
     let mut keys: Vec<Vec<DKey>> = Vec::with_capacity(per_chunk.len());
     let mut kcounts: Vec<Vec<u32>> = Vec::with_capacity(per_chunk.len());
-    for (a, b, c) in per_chunk {
+    let mut ucounts: Vec<Vec<u32>> = Vec::with_capacity(per_chunk.len());
+    for (a, b, c, d) in per_chunk {
         pays.push(a);
         keys.push(b);
         kcounts.push(c);
+        ucounts.push(d);
     }
     let key_refs: Vec<&[DKey]> = keys.iter().map(|v| v.as_slice()).collect();
     let pay_bytes: usize = pays.iter().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<UEv>();
@@ -2055,56 +2059,58 @@ last,b,c,d,e,f,g"#
 
     // dedup within each event shard, keep surviving events, re-scatter by person
     lap("  pre-bitmaps");
-    // winner bitmaps, one per chunk, over that chunk's valid payloads
+    // winner bitmaps, one per chunk, over that chunk's valid payloads. Every valid payload starts
+    // as a winner; dedup clears only the losers (a few % of events), so atomics are rare.
     let wcount: Vec<Vec<std::sync::atomic::AtomicU32>> =
-        pays.iter().map(|_| (0..NSH).map(|_| std::sync::atomic::AtomicU32::new(0)).collect()).collect();
+        ucounts.into_iter().map(|v| v.into_iter().map(std::sync::atomic::AtomicU32::new).collect()).collect();
     let bits: Vec<Vec<std::sync::atomic::AtomicU64>> =
-        pays.iter().map(|v| (0..v.len() / 64 + 1).map(|_| std::sync::atomic::AtomicU64::new(0)).collect()).collect();
-    // per-thread open-addressing table (reused across shards): slot -> index of the best copy
+        pays.iter().map(|v| (0..v.len() / 64 + 1).map(|_| std::sync::atomic::AtomicU64::new(u64::MAX)).collect()).collect();
+    let lose = |loc: u64| {
+        let idx = (loc & 0xFFFF_FFFF) as usize;
+        if idx != u32::MAX as usize {
+            let chunk = ((loc >> 32) & 0xFFFF) as usize;
+            bits[chunk][idx / 64].fetch_and(!(1u64 << (idx % 64)), std::sync::atomic::Ordering::Relaxed);
+            wcount[chunk][(loc >> 48) as usize].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+    // per-thread open-addressing table (reused across shards): one u64 per slot holding the
+    // hash's high 40 bits and (index + 1) in the low 24 bits; ~62% load keeps it L2-resident
     (0..NSH).into_par_iter().for_each_init(
-        || (Vec::<u64>::new(), Vec::<u32>::new()),
-        |(tk, tv), shi| {
+        || Vec::<u64>::new(),
+        |tab, shi| {
             let ks = &key_all[key_off[shi]..key_off[shi + 1]];
             if ks.is_empty() {
                 return;
             }
-            let cap = (ks.len() * 2).next_power_of_two();
+            assert!(ks.len() < (1 << 24) - 1, "dedup shard too large for 24-bit slot index");
+            let cap = (ks.len() + ks.len() / 4 + 1).next_power_of_two();
             let mask = cap - 1;
-            tk.clear();
-            tk.resize(cap, 0);
-            tv.resize(cap, 0);
+            const LO: u64 = (1 << 24) - 1;
+            tab.clear();
+            tab.resize(cap, 0);
             for (i, k) in ks.iter().enumerate() {
-                let tag = k.eh | 1; // 0 marks an empty slot
+                let hi = k.eh & !LO;
                 let mut slot = (k.eh.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & mask;
                 loop {
-                    let t = tk[slot];
+                    let t = tab[slot];
                     if t == 0 {
-                        tk[slot] = tag;
-                        tv[slot] = i as u32;
+                        tab[slot] = hi | (i as u64 + 1);
                         break;
                     }
-                    if t == tag {
-                        let j = tv[slot] as usize;
+                    if t & !LO == hi {
+                        let j = (t & LO) as usize - 1;
                         if ks[j].eh == k.eh && ks[j].eh2 == k.eh2 {
-                            // same event: keep the earliest ingest (equal ingest => identical copies)
+                            // same event: keep the earliest ingest; on a tie the earlier copy (file order) stays
                             if k.ing < ks[j].ing {
-                                tv[slot] = i as u32;
+                                tab[slot] = hi | (i as u64 + 1);
+                                lose(ks[j].loc);
+                            } else {
+                                lose(k.loc);
                             }
                             break;
                         }
                     }
                     slot = (slot + 1) & mask;
-                }
-            }
-            for slot in 0..cap {
-                if tk[slot] != 0 {
-                    let loc = ks[tv[slot] as usize].loc;
-                    let idx = (loc & 0xFFFF_FFFF) as usize;
-                    let chunk = ((loc >> 32) & 0xFFFF) as usize;
-                    if idx != u32::MAX as usize {
-                        bits[chunk][idx / 64].fetch_or(1 << (idx % 64), std::sync::atomic::Ordering::Relaxed);
-                        wcount[chunk][(loc >> 48) as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
                 }
             }
         },
