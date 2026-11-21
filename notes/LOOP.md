@@ -218,3 +218,4 @@ Note: docker works here (start dockerd; base images from local shopping-sessions
 USER DIRECTION (Nov 21 ~16:00 UTC): stop creating new designs/experiments; keep refining the current best code (v54 = main; dev v56 = v54 + exact ties) with small incremental edits, keep only confirmed improvements, fewer tests.
 | R1 | refine best: parser PF_DIST 1024/2048/4096/8192 (PARSESTAGE, 3 rounds) | 2048: 64-76 ns | 1024: 66-68, 4096: 63-72, 8192: 63-68 | flat: unchanged |
 | R2 | refine best: CHUNK 32 -> 16 MB (24 runs) | wall 1.394 / cpu 5.168 | 1.412 (10/24) / 5.332 (9/24) | not better: unchanged |
+| R3 | refine best: write-combining burst 384 -> 512 B (24 runs) | wall 1.284 / cpu 4.738 | 1.333 (7/24) / 4.902 (7/24) | worse: unchanged |
