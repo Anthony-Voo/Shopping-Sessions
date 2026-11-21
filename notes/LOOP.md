@@ -245,3 +245,4 @@ USER DIRECTION (Nov 21 ~16:00 UTC): stop creating new designs/experiments; keep 
 | R23 | parse: lazy bounds for product/price fields — rejected on analysis (product_id is required on every event; only price is purchase-only: 1 of 7 fields) | — | — | not run |
 | R24 | parse: hoist ws/1000 out of the per-line ingest conversion | 66.4 ns/line median (5 rounds) | 65.9 (3/5) | tie (compiler already hoists it): reverted |
 PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried on the parser: sliding mask window, pdep comma positions, AES hash, event-ts month cache, ingest no-revalidation, raw-pointer pushes, lazy fields, ws hoist, PF_DIST 1k-8k, CHUNK 16 MB, 512-bit autovectorization: all ties or losses.
+| R25 | parse: test the F1 timestamp shape first (58% of lines), F3/F2 after | 63.5-67.3 ns/line (6 rounds) | 63.3-67.0 (3/6) | tie: reverted (exact: gate, SELFTEST) |
