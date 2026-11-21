@@ -1546,17 +1546,42 @@ fn partition_sized<T: Copy + Send + Sync>(
     let mut out: Vec<T> = Vec::with_capacity(run.max(min_bytes.div_ceil(std::mem::size_of::<T>().max(1))));
     let ptr = SendPtr(out.as_mut_ptr());
     let ptr = &ptr;
-    parts.par_iter().zip(starts.into_par_iter()).enumerate().for_each(|(pi, (v, mut pos))| {
-        for (i, x) in v.iter().enumerate() {
-            if !keep(pi, i) {
-                continue;
+    // software write-combining: stage each shard's elements in a ~256 B buffer (all buffers
+    // together ~256 KB, L2-resident) and flush full buffers as one contiguous burst, so the
+    // 1024-way scatter costs one TLB/cache miss per burst instead of one per element
+    let e = (256 / std::mem::size_of::<T>().max(1)).max(1);
+    parts.par_iter().zip(starts.into_par_iter()).enumerate().for_each_init(
+        || (Vec::<T>::with_capacity(NSH * e), vec![0u16; NSH]),
+        |(buf, fill), (pi, (v, mut pos))| {
+            let bp = buf.as_mut_ptr();
+            for (i, x) in v.iter().enumerate() {
+                if !keep(pi, i) {
+                    continue;
+                }
+                let k = key(x);
+                let f = fill[k] as usize;
+                // SAFETY: k*e + f < NSH*e = buf capacity (T: Copy, slots are only read after a write)
+                unsafe { bp.add(k * e + f).write(*x) };
+                if f + 1 == e {
+                    // SAFETY: each (chunk, shard) owns the disjoint range [starts, starts+count)
+                    unsafe { std::ptr::copy_nonoverlapping(bp.add(k * e), ptr.0.add(pos[k]), e) };
+                    pos[k] += e;
+                    fill[k] = 0;
+                } else {
+                    fill[k] = (f + 1) as u16;
+                }
             }
-            let k = key(x);
-            // SAFETY: each (chunk, shard) owns the disjoint range [starts, starts+count)
-            unsafe { ptr.0.add(pos[k]).write(*x) };
-            pos[k] += 1;
-        }
-    });
+            for k in 0..NSH {
+                let f = fill[k] as usize;
+                if f > 0 {
+                    // SAFETY: as above; the tail fits the shard's remaining range
+                    unsafe { std::ptr::copy_nonoverlapping(bp.add(k * e), ptr.0.add(pos[k]), f) };
+                    pos[k] += f;
+                    fill[k] = 0;
+                }
+            }
+        },
+    );
     // SAFETY: all `run` slots were written above
     unsafe { out.set_len(run) };
     (out, off)
