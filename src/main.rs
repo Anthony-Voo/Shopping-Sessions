@@ -25,7 +25,7 @@ const HUGE: i64 = i64::MAX; // F3 too long for i64: valid form, outside every wi
 const SH_BITS: u32 = 8; // shard count = 2^SH_BITS
 const NSH: usize = 1 << SH_BITS;
 const PF_DIST: usize = 2048; // parser prefetch distance (bytes)
-const CHUNK: usize = 8 << 20; // bytes per parse task
+const CHUNK: usize = 32 << 20; // bytes per parse task
 const ORGANIC: u32 = u32::MAX;
 const UNKNOWN_CAT: u32 = u32::MAX;
 
@@ -1762,7 +1762,7 @@ fn partition_sized<T: Copy + Send + Sync>(
         }
         let base = 64 / a;
         let mut n = base;
-        while n * sz < 192 {
+        while n * sz < 384 {
             n += base;
         }
         n
