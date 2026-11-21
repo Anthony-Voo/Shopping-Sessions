@@ -260,3 +260,11 @@ PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried 
 | R35 | PGO profile weighted toward 60M (current p20m profile x3 + one p60m run x1) | v58: 60M 4.337 / 4.245; 20M 1.269 | 60M 4.153 (7/10) / 4.215 (7/12, cpu 4/12); 20M 1.317 (4/24) | 60M pooled ~tie (wall 14/22, cpu 11/22), 20M worse: not adopted |
 | R36 | -C target-cpu=skylake-avx512 instead of cascadelake (same ISA; PGO) | v58: 20M 1.274 / 1.286; 60M 4.240 | 1.214 (15/24) / 1.266 (16/24); 60M 4.373 (3/10) | 20M borderline (31/48), 60M worse: not adopted |
 | R37 | NCPU 4/5/6 at 60M — skipped (the scorer forces NCPU=8 on 4 cores x HT; this VM has 4 plain vCPUs, so the result would not transfer); radix histogram reuse — skipped (512 x 16 KB allocations, unmeasurable) | — | — | build and source levers exhausted; loop to 30-min heartbeat |
+
+## LANG — should we leave Rust? (measured, no)
+- Rust fixed cost: v58 on 48 KB input 6.4 ms vs empty C main 1.1 ms -> ~5 ms of 1190.
+- Kernel A (naive byte loops: scan to user_id, FNV hash, open-addr count, parse last field), 20.8M lines / 1.6 GB, 1 thread, 3 runs each, identical outputs:
+  gcc C 2.62-2.93 s | Go 2.90-3.00 | Rust 3.64-3.84 | clang C 3.66-3.94 | Zig 0.17 3.59-3.97 | OCaml 4.14 4.76-5.00.
+  LLVM (Rust=clang=Zig) loses ~28% to gcc only on naive per-byte loops (extra induction vars in scan loops); clang -fno-vectorize/-fno-unroll/-O2 don't close it.
+- Kernel B (our style: AVX-512 64B separator masks + tzcnt walk + crc hash): gcc 1.65-1.88 s vs clang 1.76-1.89 -> tie.
+- Conclusion: compiler/language is not the gap; our hot code is mask/intrinsic based. MoonBit not installed (no SIMD intrinsics; would be slower). Hand asm: no expected win over intrinsics.
