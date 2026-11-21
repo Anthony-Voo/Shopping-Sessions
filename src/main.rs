@@ -3010,11 +3010,24 @@ last,b,c,d,e,f,g"#
         c * ndays + (day - day0) as usize
     };
     let cbase = ws - WEEK;
-    let results: Vec<(Vec<URow>, Vec<[i64; 4]>)> = pev_slices
+    // largest shards first, one shard per task: a shard holding a whale user (5x the mean) starts
+    // at once instead of being picked up last while the other threads sit idle
+    let mut work: Vec<(usize, (&mut [PR], &mut [CR]))> = pev_slices.into_iter().zip(pcl_slices).enumerate().collect();
+    work.sort_unstable_by_key(|(_, (e, c))| std::cmp::Reverse(e.len() + c.len()));
+    // one campaign x day accumulator per thread (reused across its shards), not one per task
+    let nthreads = rayon::current_num_threads();
+    let accs: Vec<std::sync::Mutex<Vec<[i64; 4]>>> = (0..nthreads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    let mut results: Vec<(Vec<URow>, Vec<[i64; 4]>)> = work
         .into_par_iter()
-        .zip(pcl_slices.into_par_iter())
-        .enumerate()
-        .fold(|| (Vec::<URow>::new(), vec![[0i64; 4]; ncamp * ndays]), |(mut urows, mut camp), (sh, (evs, cls))| {
+        .with_max_len(1)
+        .map(|(sh, (evs, cls))| {
+            let mut urows: Vec<URow> = Vec::new();
+            let ti = rayon::current_thread_index().unwrap_or(0) % nthreads;
+            let mut guard = accs[ti].lock().unwrap();
+            if guard.is_empty() {
+                *guard = vec![[0i64; 4]; ncamp * ndays];
+            }
+            let camp: &mut Vec<[i64; 4]> = &mut guard;
             // group by person with a counting sort over the shard's contiguous id range, then sort
             // each person's (few) events by time; clicks are grouped the same way
             let base = (sh as u32) << PL_BITS;
@@ -3163,9 +3176,12 @@ last,b,c,d,e,f,g"#
                     urows.push(finish(r, &mut cats, &cat_names));
                 }
             }
-            (urows, camp)
+            (urows, Vec::new())
         })
         .collect();
+    for a in accs {
+        results.push((Vec::new(), a.into_inner().unwrap()));
+    }
     fn finish(mut r: URow, cats: &mut Vec<(u32, i64)>, cat_names: &[B]) -> URow {
         let name_of = |c: u32| -> &[u8] { if c == UNKNOWN_CAT { b"unknown" } else { cat_names[c as usize] } };
         let mut best: Option<(u32, i64)> = None;
