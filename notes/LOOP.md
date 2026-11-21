@@ -226,3 +226,4 @@ USER DIRECTION (Nov 21 ~16:00 UTC): stop creating new designs/experiments; keep 
 | R7 | refine best: links interner table 2x -> 4x pairs (links thread NCPU=1, 4 runs each) | 20M 0.213-0.248, 60M 0.611-0.758 | 0.193-0.248, 0.635-0.883 | within noise: unchanged |
 | R8 | refine best: dedup table 2x -> 4x | dedup lap 0.0535, total 1.212 (16) | 0.0570 (1/16), 1.270 | worse (table outgrows L2): 2x is the sweet spot |
 | R9 | refine best: resolve map reserve lkm*2+1024 -> lkm*4+8192 | regroup 0.1240, total 1.198 (16) | 0.1805 (0/16), 1.210 | much worse (bigger reused map costs more to clear/rehash): try smaller next |
+| R10 | refine best: resolve map reserve lkm*2+1024 -> lkm+256 | regroup 0.1705 (16); totals 1.282 / 1.256 | regroup 0.1525 (12/16); totals 1.359 (5/24) / 1.327 (5/24) | stage lap better but both totals lose: rejected; current reserve sits between two worse settings |
