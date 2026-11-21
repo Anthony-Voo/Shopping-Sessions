@@ -38,7 +38,23 @@ type B = &'static [u8];
 /// original bytes by the callers, so this only has to be fast and well mixed.
 #[inline]
 fn h64(b: &[u8]) -> u64 {
-    h64s(b, 0x9E37_79B9_7F4A_7C15)
+    h12(b).0
+}
+
+/// 64x64 -> 128-bit multiply, folded (wyhash's "mum"): one multiply mixes all input bits.
+#[inline(always)]
+fn mum(a: u64, b: u64) -> (u64, u64) {
+    let r = (a as u128) * (b as u128);
+    (r as u64, (r >> 64) as u64)
+}
+
+/// Shared finish of h12 / h12_over: from the chain state and the masked tail word, two
+/// well-mixed 64-bit outputs (two 128-bit multiplies).
+#[inline(always)]
+fn h12_fin(h: u64, t: u64, len: u64) -> (u64, u64) {
+    let (a, b) = mum(h ^ t ^ 0xE703_7ED1_A0B4_28DB, len ^ 0x8EBC_6AF0_9C88_C6E3);
+    let (c, d) = mum(a ^ 0x5899_65CC_7537_4CC3, b ^ 0x1D8E_4E27_C47D_124F);
+    (a ^ b, c ^ d)
 }
 
 /// h12 for a field that is followed by at least 8 more bytes of the same line (event_id and
@@ -46,63 +62,45 @@ fn h64(b: &[u8]) -> u64 {
 /// masked 8-byte load instead of a byte loop. Identical results to h12 (checked by SELFTEST).
 #[inline(always)]
 fn h12_over(b: &[u8]) -> (u64, u64) {
-    let len = (b.len() as u64).wrapping_mul(0xA076_1D64_78BD_642F);
-    let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ len;
-    let mut y: u64 = 0xD6E8_FEB8_6659_FD93 ^ len;
+    let len = b.len() as u64;
+    let mut h: u64 = 0xA076_1D64_78BD_642F ^ len.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let mut i = 0;
     while i + 8 <= b.len() {
         let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        x = (x ^ w).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-        x ^= x >> 32;
-        y = (y ^ w).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-        y ^= y >> 32;
+        let (lo, hi) = mum(h ^ w, 0xE703_7ED1_A0B4_28DB);
+        h = lo ^ hi;
         i += 8;
     }
     let rem = b.len() - i;
     // SAFETY: callers guarantee >= 8 readable bytes after the field (same mapped line)
     let raw = unsafe { std::ptr::read_unaligned(b.as_ptr().add(i) as *const u64) };
     let t = if rem == 0 { 0 } else { raw & (u64::MAX >> (64 - 8 * rem)) };
-    let fin = |mut h: u64| {
-        h = (h ^ t).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
-        h ^= h >> 29;
-        h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
-        h ^ (h >> 32)
-    };
-    (fin(x), fin(y))
+    h12_fin(h, t, len)
 }
 
 /// Both hashes in one pass over the bytes: (h64(b), h2(b)).
 #[inline]
 fn h12(b: &[u8]) -> (u64, u64) {
-    let len = (b.len() as u64).wrapping_mul(0xA076_1D64_78BD_642F);
-    let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ len;
-    let mut y: u64 = 0xD6E8_FEB8_6659_FD93 ^ len;
+    let len = b.len() as u64;
+    let mut h: u64 = 0xA076_1D64_78BD_642F ^ len.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let mut i = 0;
     while i + 8 <= b.len() {
         let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        x = (x ^ w).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-        x ^= x >> 32;
-        y = (y ^ w).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-        y ^= y >> 32;
+        let (lo, hi) = mum(h ^ w, 0xE703_7ED1_A0B4_28DB);
+        h = lo ^ hi;
         i += 8;
     }
     let mut t = 0u64;
     for (k, &c) in b[i..].iter().enumerate() {
         t |= (c as u64) << (8 * k);
     }
-    let fin = |mut h: u64| {
-        h = (h ^ t).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
-        h ^= h >> 29;
-        h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
-        h ^ (h >> 32)
-    };
-    (fin(x), fin(y))
+    h12_fin(h, t, len)
 }
 
 /// Independent second hash: (h64, h2) together identify a string (2^-128 collision odds).
 #[inline]
 fn h2(b: &[u8]) -> u64 {
-    h64s(b, 0xD6E8_FEB8_6659_FD93)
+    h12(b).1
 }
 
 #[inline]
