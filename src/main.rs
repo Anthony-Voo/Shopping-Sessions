@@ -1483,6 +1483,20 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+}
+
+/// How input files are brought into memory (MAPMODE env; default below).
+fn map_mode() -> u8 {
+    match std::env::var("MAPMODE").as_deref() {
+        Ok("populate") => 0,
+        Ok("willneed") => 1,
+        Ok("seq") => 2,
+        Ok("none") => 3,
+        // default: lazy faulting, so reading the (possibly cold) input overlaps with parsing
+        // on all threads instead of one up-front populate (cold 20M: 2.24 s -> 1.72 s; warm: tie)
+        _ => 3,
+    }
 }
 
 /// Map a file read-only (no copy, no allocation); falls back to reading it.
@@ -1494,9 +1508,21 @@ fn map_file(p: &Path) -> B {
         return &[];
     }
     // PROT_READ=1, MAP_PRIVATE=2, MAP_POPULATE=0x8000
-    let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2 | 0x8000, f.as_raw_fd(), 0) };
+    let mode = map_mode();
+    let flags = if mode == 0 { 2 | 0x8000 } else { 2 };
+    let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, flags, f.as_raw_fd(), 0) };
     if ptr as isize == -1 || ptr.is_null() {
         return Box::leak(std::fs::read(p).expect("read").into_boxed_slice());
+    }
+    // MADV_SEQUENTIAL=2, MADV_WILLNEED=3: start read-ahead without waiting for it
+    match mode {
+        1 => unsafe {
+            madvise(ptr, len, 3);
+        },
+        2 => unsafe {
+            madvise(ptr, len, 2);
+        },
+        _ => {}
     }
     // the mapping outlives the File handle and is never unmapped (process exits)
     unsafe { std::slice::from_raw_parts(ptr, len) }
