@@ -24,6 +24,7 @@ const BAD: i64 = i64::MIN; // unparseable timestamp
 const HUGE: i64 = i64::MAX; // F3 too long for i64: valid form, outside every window
 const SH_BITS: u32 = 10; // shard count = 2^SH_BITS
 const NSH: usize = 1 << SH_BITS;
+const PF_DIST: usize = 2048; // parser prefetch distance (bytes)
 const CHUNK: usize = 8 << 20; // bytes per parse task
 const ORGANIC: u32 = u32::MAX;
 const UNKNOWN_CAT: u32 = u32::MAX;
@@ -954,6 +955,15 @@ fn parse_event_chunk5(
     let mut next_start = 0usize;
     while next_start < n {
         let line_start = next_start;
+        // software prefetch: the file mapping is 4 KB pages, where the hardware prefetcher stops
+        #[cfg(target_feature = "sse")]
+        {
+            let pf = line_start + PF_DIST;
+            if pf < n {
+                // SAFETY: in-bounds address; prefetch has no architectural effect
+                unsafe { std::arch::x86_64::_mm_prefetch(chunk.as_ptr().add(pf) as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+            }
+        }
         let mut k = 0usize;
         let mut nq = 0u32;
         let mut off = line_start;
