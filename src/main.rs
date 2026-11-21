@@ -3132,7 +3132,7 @@ last,b,c,d,e,f,g"#
                 return;
             }
             assert!(ks.len() < (1 << 24) - 1, "dedup shard too large for 24-bit slot index");
-            let cap = (ks.len() + ks.len() / 4 + 1).next_power_of_two();
+            let cap = (ks.len() * 2 + 1).next_power_of_two();
             let mask = cap - 1;
             const LO: u64 = (1 << 24) - 1;
             tab.clear();
