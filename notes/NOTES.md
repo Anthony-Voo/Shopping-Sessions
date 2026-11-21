@@ -34,3 +34,6 @@ v51 board 1.19 vs v45 1.22 (−2.5%) though local A/B said ≈ −20%. Re-check 
 at NCPU=8 (scorer's setting, oversubscribed on this 4-vCPU VM) gaps shrink to ~0-15%; cold page cache: v45 ~2.0 vs v51 ~1.78.
 Most local wins were CPU-stage wins on 4 dedicated threads; the scorer is 8 hyperthreads (4 cores) and likely bound elsewhere
 (I/O or memory bandwidth). Local A/B is not a reliable predictor of the board any more.
+
+## Nov 21 ~14:45 UTC: main fast-forwarded to 850b4d3 (v54)
+v54 vs v51 (24 interleaved runs, 20M): wall 1.444 -> 1.353 s (-6.3%), CPU -6.9%; at 60M a tie (4.60 -> 4.57). Not yet submitted; predicted board ~1.10-1.15 s (v51 scored 1.19).
