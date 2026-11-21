@@ -1852,7 +1852,8 @@ fn unpack_ref(r: u64) -> B {
 }
 
 #[derive(Clone, Copy)]
-struct PEv {
+#[repr(C, packed(2))]
+struct PEv { // 30 bytes: no padding (unaligned field loads are free on x86)
     pk: u64,    // h64(user_id); with pk2 a 96-bit user identity
     nref: u64,  // user_id bytes in the input mapping: pointer (low 48 bits) | length << 48
     pk2: u32,   // low 32 bits of h2(user_id)
