@@ -5,8 +5,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY .cargo ./.cargo
 COPY vendor ./vendor
-# Target the scorer's Cascade Lake+ CPUs.
-ENV RUSTFLAGS="-C target-cpu=cascadelake"
+COPY pgo ./pgo
+# Target the scorer's Cascade Lake+ CPUs; profile-guided optimization from pgo/merged.profdata
+# (made with notes/pgo.sh by the same rustc 1.90 from this source on generator data).
+ENV RUSTFLAGS="-C target-cpu=cascadelake -Cprofile-use=/src/pgo/merged.profdata"
 RUN cargo build --release --locked --offline && strip target/release/sessions
 
 FROM debian:bookworm-slim
