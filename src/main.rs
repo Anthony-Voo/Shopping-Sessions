@@ -2003,6 +2003,44 @@ fn cref_name(chunks: &[B], r: u32) -> B {
     }
 }
 
+/// Stable LSD radix sort of `a` by the low 32 bits of `key` in three passes (11/11/10 bits);
+/// `b` is scratch of the same length and holds the result.
+fn radix_lo32<T: Copy>(a: &mut [T], b: &mut [T], key: impl Fn(&T) -> u32, mut hook: impl FnMut(&T)) {
+    debug_assert_eq!(a.len(), b.len());
+    const D: usize = 2048;
+    let mut h = vec![0u32; 3 * D];
+    for r in a.iter() {
+        hook(r);
+        let k = key(r);
+        h[(k & 2047) as usize] += 1;
+        h[D + ((k >> 11) & 2047) as usize] += 1;
+        h[2 * D + (k >> 22) as usize] += 1;
+    }
+    for p in 0..3 {
+        let mut s = 0u32;
+        for c in h[p * D..(p + 1) * D].iter_mut() {
+            let n = *c;
+            *c = s;
+            s += n;
+        }
+    }
+    for r in a.iter() {
+        let d = (key(r) & 2047) as usize;
+        b[h[d] as usize] = *r;
+        h[d] += 1;
+    }
+    for r in b.iter() {
+        let d = D + ((key(r) >> 11) & 2047) as usize;
+        a[h[d] as usize] = *r;
+        h[d] += 1;
+    }
+    for r in a.iter() {
+        let d = 2 * D + (key(r) >> 22) as usize;
+        b[h[d] as usize] = *r;
+        h[d] += 1;
+    }
+}
+
 #[inline]
 fn shard_pid(pid: u32) -> usize {
     ((pid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SH_BITS)) as usize
@@ -3187,36 +3225,35 @@ last,b,c,d,e,f,g"#
             let np = roots_by_shard[sh].len() + unl_names_by_shard[sh].len();
             let li = |key: u64| -> usize { ((key >> 32) as u32 - base) as usize };
             let mut eoff = vec![0u32; np + 1];
-            for r in evin.iter() {
-                eoff[li(r.key) + 1] += 1;
-            }
+            let mut eg: Vec<PR> = Vec::with_capacity(evin.len());
+            // SAFETY: every slot in 0..evin.len() is written exactly once below
+            unsafe { eg.set_len(evin.len()) };
+            // whole-shard stable radix sort by ts (3 passes, ends in eg; the person count rides on
+            // its histogram pass), then a stable counting sort by person back into evin: every
+            // person's events come out ordered by time with no per-person sort
+            radix_lo32(evin, &mut eg, |r: &PR| r.key as u32, |r: &PR| eoff[li(r.key) + 1] += 1);
             for p in 0..np {
                 eoff[p + 1] += eoff[p];
             }
-            let mut eg: Vec<PR> = Vec::with_capacity(evin.len());
             let mut pos = eoff.clone();
-            // SAFETY: every slot in 0..evin.len() is written exactly once below
-            unsafe { eg.set_len(evin.len()) };
-            for r in evin.iter() {
+            for r in eg.iter() {
                 let l = li(r.key);
-                eg[pos[l] as usize] = *r;
+                evin[pos[l] as usize] = *r;
                 pos[l] += 1;
             }
             let mut coff = vec![0u32; np + 1];
-            for c in cls.iter() {
-                coff[li(c.key) + 1] += 1;
-            }
-            for p in 0..np {
-                coff[p + 1] += coff[p];
-            }
             let ncl = cls.len();
             let mut cg: Vec<CR> = Vec::with_capacity(ncl);
             // SAFETY: every slot in 0..ncl is written exactly once below
             unsafe { cg.set_len(ncl) };
+            radix_lo32(cls, &mut cg, |c: &CR| c.key as u32, |c: &CR| coff[li(c.key) + 1] += 1);
+            for p in 0..np {
+                coff[p + 1] += coff[p];
+            }
             let mut cpos = coff.clone();
-            for c in cls.iter() {
+            for c in cg.iter() {
                 let l = li(c.key);
-                cg[cpos[l] as usize] = *c;
+                cls[cpos[l] as usize] = *c;
                 cpos[l] += 1;
             }
             let mut cats: Vec<(u32, i64)> = vec![];
@@ -3225,38 +3262,20 @@ last,b,c,d,e,f,g"#
             let mut acnt: Vec<u32> = vec![0; ncamp];
             let mut apos: Vec<u32> = vec![0; ncamp];
             let mut alist: Vec<u32> = Vec::new();
-            let mut skeys: Vec<u64> = Vec::new();
             for p in 0..np {
                 if eoff[p] == eoff[p + 1] {
                     continue; // no events: this person has no sessions
                 }
-                // sort u64 keys (ts << 32 | index) instead of 14-byte packed records (the small-sort
-                // networks only apply to plain integers), then gather into the free input buffer
                 let (e0, e1) = (eoff[p] as usize, eoff[p + 1] as usize);
-                let grp = &eg[e0..e1];
-                skeys.clear();
-                skeys.extend(grp.iter().enumerate().map(|(i, r)| (r.key << 32) | i as u64));
-                skeys.sort_unstable();
-                let evs = &mut evin[e0..e1];
-                for (d, &k) in evs.iter_mut().zip(skeys.iter()) {
-                    *d = grp[(k & 0xFFFF_FFFF) as usize];
-                }
-                let evs = &*evs;
-                // by ts ascending; equal ts ordered by click_id DESCENDING so the last eligible
-                // click is the winner (latest ts, then smallest click_id). Sort u64 keys
-                // (ts << 32 | index), gather into the free input buffer, then fix equal-ts runs.
+                let evs = &evin[e0..e1];
+                // clicks: by ts ascending; equal ts ordered by click_id DESCENDING so the last
+                // eligible click is the winner (latest ts, then smallest click_id): fix equal-ts runs
                 let (c0, c1) = (coff[p] as usize, coff[p + 1] as usize);
-                let cgrp = &cg[c0..c1];
-                skeys.clear();
-                skeys.extend(cgrp.iter().enumerate().map(|(i, r)| (r.key << 32) | i as u64));
-                skeys.sort_unstable();
                 let pcl = &mut cls[c0..c1];
                 let mut eq = false;
-                let mut pk = u64::MAX;
-                for (d, &k) in pcl.iter_mut().zip(skeys.iter()) {
-                    eq |= k >> 32 == pk;
-                    pk = k >> 32;
-                    *d = cgrp[(k & 0xFFFF_FFFF) as usize];
+                for w in pcl.windows(2) {
+                    let (a, b) = (w[0].key, w[1].key);
+                    eq |= a == b;
                 }
                 if eq {
                     let mut a = 0;
