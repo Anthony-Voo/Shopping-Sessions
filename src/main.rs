@@ -22,7 +22,7 @@ const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const BAD: i64 = i64::MIN; // unparseable timestamp
 const HUGE: i64 = i64::MAX; // F3 too long for i64: valid form, outside every window
-const SH_BITS: u32 = 10; // shard count = 2^SH_BITS
+const SH_BITS: u32 = 8; // shard count = 2^SH_BITS
 const NSH: usize = 1 << SH_BITS;
 const PF_DIST: usize = 2048; // parser prefetch distance (bytes)
 const CHUNK: usize = 8 << 20; // bytes per parse task
@@ -2181,6 +2181,22 @@ last,b,c,d,e,f,g"#
             }
         }
         eprintln!("SELFTEST ok: two-stage parser identical on {cks} chunk variants");
+        std::process::exit(0);
+    }
+    if std::env::var_os("PARSE5BENCH").is_some() {
+        // single-threaded parse_event_chunk5 over all event chunks: best of 3 passes
+        let mut best = f64::MAX;
+        let mut n = 0usize;
+        for _ in 0..3 {
+            let t = Instant::now();
+            n = 0;
+            for (ci, &c) in ev_chunks.iter().enumerate() {
+                let o = parse_event_chunk5(c, ci, ws, we, &products);
+                n += o.0.len() + o.1.len();
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!("PARSE5BENCH best {:.3}s (out {n})", best);
         std::process::exit(0);
     }
     if let Ok(level) = std::env::var("PARSEBENCH") {
