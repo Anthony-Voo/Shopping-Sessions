@@ -227,3 +227,4 @@ USER DIRECTION (Nov 21 ~16:00 UTC): stop creating new designs/experiments; keep 
 | R8 | refine best: dedup table 2x -> 4x | dedup lap 0.0535, total 1.212 (16) | 0.0570 (1/16), 1.270 | worse (table outgrows L2): 2x is the sweet spot |
 | R9 | refine best: resolve map reserve lkm*2+1024 -> lkm*4+8192 | regroup 0.1240, total 1.198 (16) | 0.1805 (0/16), 1.210 | much worse (bigger reused map costs more to clear/rehash): try smaller next |
 | R10 | refine best: resolve map reserve lkm*2+1024 -> lkm+256 | regroup 0.1705 (16); totals 1.282 / 1.256 | regroup 0.1525 (12/16); totals 1.359 (5/24) / 1.327 (5/24) | stage lap better but both totals lose: rejected; current reserve sits between two worse settings |
+| R11 | refine best: sessionize campaign table day-major instead of campaign-major | sess 0.225, total 1.290 (16); sets 1.296 / 1.247 | 0.222, 1.221 (13/16); sets 1.289 (10/24) / 1.277 (6/24) | not confirmed: reverted (exact: gate + seed 219) |
