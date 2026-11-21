@@ -210,3 +210,6 @@ Note: docker works here (start dockerd; base images from local shopping-sessions
 | exp-sh10 | branch exp-sh10 = v54 with SH_BITS 10 (1024 shards: ~0.8 MB sessionize shards at 60M instead of 3.2 MB) | 60M local v54 4.298 | 4.358 (1/6) | output identical; locally a slight loss; OPTIONAL board test by SHA 7d7abd0 (user decides) |
 | exp-sh10 @20M | v54 vs v54+SH_BITS 10, 16 runs | wall 1.417 / cpu 5.292 | 1.378 (10/16) / 5.117 (11/16) | tie/slightly better at 20M: a fair optional board test (SHA 7d7abd0) |
 | robustness | fresh 60M dataset (generate seed 7781, 5.2 GB): v54, v56, v51, exp-sh10 | — | all exit 0; outputs identical (compare.py MATCH x3); warm wall 3.9-4.9 s each (noise); peak RSS 11.3 GB incl. the 5.2 GB file mapping (anon ~6 GB) vs 24 GB container | final-size safety confirmed for main v54 |
+| diag | parse tail balance (20M warm): 4 threads finish within ~20 ms of each other (~1% idle) | — | — | not a lever |
+| diag | parser line profile (PARSESTAGE=4, 62.5 ns/line): flat — comma extraction + u128 helpers ~12%, event ts ~8.5%, field bounds/quotes ~5%, two id hashes ~5.5%, nothing > 6% alone | — | — | — |
+| G32 | comma positions via BMI2 pdep per k (parallel) instead of the clear-lowest-bit chain on u128 | 62.6-65.4 ns/line | 67.3-75.0 | slower: reverted |
