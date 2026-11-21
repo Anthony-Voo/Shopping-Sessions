@@ -3123,7 +3123,7 @@ last,b,c,d,e,f,g"#
         }
     };
     // per-thread open-addressing table (reused across shards): one u64 per slot holding the
-    // hash's high 40 bits and (index + 1) in the low 24 bits; ~62% load keeps it L2-resident
+    // hash's high 40 bits and (index + 1) in the low 24 bits; capacity 2x keys (<= 50% load)
     (0..NSH).into_par_iter().for_each_init(
         || Vec::<u64>::new(),
         |tab, shi| {

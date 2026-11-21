@@ -222,3 +222,4 @@ USER DIRECTION (Nov 21 ~16:00 UTC): stop creating new designs/experiments; keep 
 | R4 | refine best: write-combining burst 384 -> 256 B (24 runs) | wall 1.371 / cpu 5.103 | 1.400 (10/24) / 5.169 (10/24) | not better: 384 B stays (both neighbours lose) |
 | R5 | refine best: links interner prefetch AHEAD 12 -> 24 / 48 (links thread, NCPU=1, 3 runs each at 20M and 60M) | 12: 0.263-0.267 / 0.70-0.88 s | 24: 0.235-0.284 / 0.70-0.78; 48: 0.209-0.295 / 0.76-0.88 | within noise: unchanged |
 | R6 | refine best: dedup table capacity (n + n/4) -> 2n, next power of two | dedup lap 0.0715, total 1.303 (16); 24-run sets: wall 1.288 / 1.312 | 0.0535 (16/16), 1.220; sets: 1.236 (19/24) / 1.216 (21/24), cpu 19/24, 22/24 | CONFIRMED in two sets: KEPT as v57 (exact: gate + seed 217) |
+| v57 vs v54 | direct, two 24-run sets | wall 1.311 / 1.282 | 1.341 (7/24) / 1.242 (20/24) | inconsistent: main stays v54 (dedup stage gain itself is solid, 16/16) |
