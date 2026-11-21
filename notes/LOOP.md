@@ -224,3 +224,4 @@ USER DIRECTION (Nov 21 ~16:00 UTC): stop creating new designs/experiments; keep 
 | R6 | refine best: dedup table capacity (n + n/4) -> 2n, next power of two | dedup lap 0.0715, total 1.303 (16); 24-run sets: wall 1.288 / 1.312 | 0.0535 (16/16), 1.220; sets: 1.236 (19/24) / 1.216 (21/24), cpu 19/24, 22/24 | CONFIRMED in two sets: KEPT as v57 (exact: gate + seed 217) |
 | v57 vs v54 | direct, two 24-run sets | wall 1.311 / 1.282 | 1.341 (7/24) / 1.242 (20/24) | inconsistent: main stays v54 (dedup stage gain itself is solid, 16/16) |
 | R7 | refine best: links interner table 2x -> 4x pairs (links thread NCPU=1, 4 runs each) | 20M 0.213-0.248, 60M 0.611-0.758 | 0.193-0.248, 0.635-0.883 | within noise: unchanged |
+| R8 | refine best: dedup table 2x -> 4x | dedup lap 0.0535, total 1.212 (16) | 0.0570 (1/16), 1.270 | worse (table outgrows L2): 2x is the sweet spot |
