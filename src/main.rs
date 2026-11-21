@@ -389,6 +389,102 @@ fn scan_lines2<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[Op
     }
 }
 
+fn scan_lines3<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[Option<&'a [u8]>; N]>)) {
+    let n = chunk.len();
+    let mut start = 0usize;
+
+    let mut pad = [0u8; 128];
+    let mut commas = [0usize; 16];
+    loop {
+        if start >= n {
+            return;
+        }
+        #[cfg(target_feature = "sse")]
+        if start + PF_DIST < n {
+            // SAFETY: in-bounds address; prefetch has no architectural effect
+            unsafe { std::arch::x86_64::_mm_prefetch(chunk.as_ptr().add(start + PF_DIST) as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+        }
+        // fast path: newline, commas and quotes of a line ending within 128 bytes from one load
+        if start + 128 <= n {
+            let (c0, n0, q0) = block_masks(&chunk[start..start + 64]);
+            let (c1, n1, q1) = block_masks(&chunk[start + 64..start + 128]);
+            let nl = (n0 as u128) | ((n1 as u128) << 64);
+            if nl != 0 {
+                let e = nl.trailing_zeros() as usize;
+                let below = (1u128 << e) - 1;
+                let cm = ((c0 as u128) | ((c1 as u128) << 64)) & below;
+                if cm.count_ones() as usize != N - 1 {
+                    f(None);
+                } else {
+                    let nq = (((q0 as u128) | ((q1 as u128) << 64)) & below).count_ones();
+                    let mut m = cm;
+                    for slot in commas.iter_mut().take(N - 1) {
+                        *slot = start + m.trailing_zeros() as usize;
+                        m &= m - 1;
+                    }
+                    f(finish_line::<N>(chunk, start, start + e, &commas[..N - 1], nq));
+                }
+                start += e + 1;
+                continue;
+            }
+        }
+        let end = memchr::memchr(b'\n', &chunk[start..]).map_or(n, |k| start + k);
+        let len = end - start;
+        if len <= 128 {
+            // two 64-byte windows; copy to a padded buffer when they would run past the chunk
+            let w: &[u8] = if start + 128 <= n {
+                &chunk[start..start + 128]
+            } else {
+                pad = [0u8; 128];
+                pad[..n - start].copy_from_slice(&chunk[start..]);
+                &pad
+            };
+            let (c0, q0) = cq_masks(&w[..64]);
+            let (c1, q1) = cq_masks(&w[64..128]);
+            let keep0 = if len >= 64 { u64::MAX } else { (1u64 << len) - 1 };
+            let keep1 = if len >= 128 { u64::MAX } else if len > 64 { (1u64 << (len - 64)) - 1 } else { 0 };
+            let (c0, c1) = (c0 & keep0, c1 & keep1);
+            let nq = (q0 & keep0).count_ones() + (q1 & keep1).count_ones();
+            let nc = (c0.count_ones() + c1.count_ones()) as usize;
+            if nc != N - 1 {
+                f(if len == 0 { None } else { None });
+            } else {
+                let mut m = c0;
+                let mut k = 0;
+                while m != 0 {
+                    commas[k] = start + m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    k += 1;
+                }
+                let mut m = c1;
+                while m != 0 {
+                    commas[k] = start + 64 + m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    k += 1;
+                }
+                f(finish_line::<N>(chunk, start, end, &commas[..k], nq));
+            }
+        } else {
+            // long line: count commas/quotes directly
+            let line = &chunk[start..end];
+            let mut k = 0;
+            let mut nq = 0u32;
+            for (i, &b) in line.iter().enumerate() {
+                if b == b',' {
+                    if k < 16 {
+                        commas[k] = start + i;
+                    }
+                    k += 1;
+                } else if b == b'"' {
+                    nq += 1;
+                }
+            }
+            f(if k == N - 1 { finish_line::<N>(chunk, start, end, &commas[..k], nq) } else { None });
+        }
+        start = end + 1;
+    }
+}
+
 /// Dedicated event-chunk parser: per-line SIMD comma/quote masks, field extraction and
 /// validation in one loop (same semantics as scan_lines::<7> + the generic event closure).
 #[allow(clippy::too_many_arguments)]
@@ -519,7 +615,7 @@ fn parse_event_chunk(
             assert!(u.len() <= 0xFFFF && (u.as_ptr() as u64) < (1 << 48), "user_id reference does not pack");
             pay.push(PEv {
                 pk: uh,
-                nref: (u.as_ptr() as u64) | ((u.len() as u64) << 48),
+                uoff: (u.as_ptr() as usize - chunk.as_ptr() as usize) as u32,
                 pk2: uh2 as u32,
                 ts: (ts - ws) as u32,
                 price: p,
@@ -718,7 +814,7 @@ fn parse_event_chunk3(
             assert!(u.len() <= 0xFFFF && (u.as_ptr() as u64) < (1 << 48), "user_id reference does not pack");
             pay.push(PEv {
                 pk: uh,
-                nref: (u.as_ptr() as u64) | ((u.len() as u64) << 48),
+                uoff: (u.as_ptr() as usize - chunk.as_ptr() as usize) as u32,
                 pk2: uh2 as u32,
                 ts: (ts - ws) as u32,
                 price: p,
@@ -914,7 +1010,7 @@ fn parse_event_chunk4(
                 assert!(u.len() <= 0xFFFF && (u.as_ptr() as u64) < (1 << 48), "user_id reference does not pack");
                 pay.push(PEv {
                     pk: uh,
-                    nref: (u.as_ptr() as u64) | ((u.len() as u64) << 48),
+                    uoff: (u.as_ptr() as usize - chunk.as_ptr() as usize) as u32,
                     pk2: uh2 as u32,
                     ts: (ts - ws) as u32,
                     price: p,
@@ -1119,7 +1215,7 @@ fn parse_event_chunk5(
                 assert!(u.len() <= 0xFFFF && (u.as_ptr() as u64) < (1 << 48), "user_id reference does not pack");
                 pay.push(PEv {
                     pk: uh,
-                    nref: (u.as_ptr() as u64) | ((u.len() as u64) << 48),
+                    uoff: (u.as_ptr() as usize - chunk.as_ptr() as usize) as u32,
                     pk2: uh2 as u32,
                     ts: (ts - ws) as u32,
                     price: p,
@@ -1334,7 +1430,7 @@ fn parse5_stage<const S: u8>(
                 assert!(u.len() <= 0xFFFF && (u.as_ptr() as u64) < (1 << 48), "user_id reference does not pack");
                 pay.push(PEv {
                     pk: uh,
-                    nref: (u.as_ptr() as u64) | ((u.len() as u64) << 48),
+                    uoff: (u.as_ptr() as usize - chunk.as_ptr() as usize) as u32,
                     pk2: uh2 as u32,
                     ts: (ts - ws) as u32,
                     price: p,
@@ -1866,20 +1962,13 @@ fn unpack_ref(r: u64) -> B {
 #[repr(C, packed(2))]
 struct PEv { // 30 bytes: no padding (unaligned field loads are free on x86)
     pk: u64,    // h64(user_id); with pk2 a 96-bit user identity
-    nref: u64,  // user_id bytes in the input mapping: pointer (low 48 bits) | length << 48
+    uoff: u32,  // user_id start, as a byte offset into this record's parse chunk (see name_at)
     pk2: u32,   // low 32 bits of h2(user_id)
     ts: u32,    // ts - window_start (valid events lie inside the window)
     price: u32, // > 0 exactly for purchases
     cat: u16,
 }
 
-impl PEv {
-    #[inline]
-    fn name(&self) -> B {
-        // SAFETY: points into an input mapping that is never unmapped
-        unsafe { std::slice::from_raw_parts((self.nref & 0xFFFF_FFFF_FFFF) as *const u8, (self.nref >> 48) as usize) }
-    }
-}
 
 /// Event after person resolution: key = person id << 32 | (ts - window_start).
 #[derive(Clone, Copy)]
@@ -2002,6 +2091,33 @@ impl ProdTab {
                 return Some(sl.2 - 1);
             }
             i = (i + 1) & self.mask;
+        }
+    }
+}
+
+/// A user_id reference resolved only when its bytes are needed (a first sighting or a hash clash).
+#[derive(Clone, Copy)]
+enum NameRef {
+    Packed(u64),  // pack_ref: pointer | length << 48 (clicks)
+    Scan(usize),  // address of the field's first byte (events): the field ends at its closing
+                  // quote if it was quoted, else at the next comma (user_id is never the last field)
+}
+
+fn name_of_ref(r: NameRef) -> B {
+    match r {
+        NameRef::Packed(x) => unpack_ref(x),
+        NameRef::Scan(p) => {
+            // SAFETY: p points into an input mapping inside a valid event line; the byte before it is
+            // ',' or '"' (user_id is field 1), and a terminator follows within the same line
+            unsafe {
+                let quoted = *((p - 1) as *const u8) == b'"';
+                let stop = if quoted { b'"' } else { b',' };
+                let mut e = p;
+                while *(e as *const u8) != stop {
+                    e += 1;
+                }
+                std::slice::from_raw_parts(p as *const u8, e - p)
+            }
         }
     }
 }
@@ -2571,8 +2687,10 @@ last,b,c,d,e,f,g"#
                 let (mut a4, mut b4): (Vec<_>, Vec<_>) = (vec![], vec![]);
                 scan_lines::<4>(c, |r| a4.push(r));
                 scan_lines2::<4>(c, |r| b4.push(r));
+                let mut c4: Vec<_> = vec![];
+                scan_lines3::<4>(c, |r| c4.push(r));
                 lines_checked += a7.len() as u64;
-                if a7 != b7 || a4 != b4 {
+                if a7 != b7 || a4 != b4 || c4 != b4 {
                     bad += 1;
                 }
             }
@@ -2621,7 +2739,7 @@ last,b,c,d,e,f,g"#
                 let (a4, b4, k4, _) = parse_event_chunk4(c, ci, ws, we, &prods);
                 assert!(
                     a4.len() == a3.len() && b4.len() == b3.len() && k4 == k3
-                        && a4.iter().zip(&a3).all(|(x, y)| x.pk == y.pk && x.nref == y.nref && x.pk2 == y.pk2 && x.ts == y.ts && x.price == y.price && x.cat == y.cat)
+                        && a4.iter().zip(&a3).all(|(x, y)| x.pk == y.pk && x.uoff == y.uoff && x.pk2 == y.pk2 && x.ts == y.ts && x.price == y.price && x.cat == y.cat)
                         && b4.iter().zip(&b3).all(|(x, y)| x.eh == y.eh && x.eh2 == y.eh2 && x.ing == y.ing && x.loc == y.loc),
                     "parse_event_chunk4 differs on chunk {ci} cut {cut}"
                 );
@@ -2629,14 +2747,14 @@ last,b,c,d,e,f,g"#
                 let (_, _, _, u4) = parse_event_chunk4(c, ci, ws, we, &prods);
                 assert!(
                     a5.len() == a4.len() && b5.len() == b4.len() && k5 == k4 && u5 == u4
-                        && a5.iter().zip(&a4).all(|(x, y)| x.pk == y.pk && x.nref == y.nref && x.pk2 == y.pk2 && x.ts == y.ts && x.price == y.price && x.cat == y.cat)
+                        && a5.iter().zip(&a4).all(|(x, y)| x.pk == y.pk && x.uoff == y.uoff && x.pk2 == y.pk2 && x.ts == y.ts && x.price == y.price && x.cat == y.cat)
                         && b5.iter().zip(&b4).all(|(x, y)| x.eh == y.eh && x.eh2 == y.eh2 && x.ing == y.ing && x.loc == y.loc),
                     "parse_event_chunk5 differs on chunk {ci} cut {cut}"
                 );
                 let same = a1.len() == a3.len()
                     && b1.len() == b3.len()
                     && k1 == k3
-                    && a1.iter().zip(&a3).all(|(x, y)| x.pk == y.pk && x.nref == y.nref && x.pk2 == y.pk2 && x.ts == y.ts && x.price == y.price && x.cat == y.cat)
+                    && a1.iter().zip(&a3).all(|(x, y)| x.pk == y.pk && x.uoff == y.uoff && x.pk2 == y.pk2 && x.ts == y.ts && x.price == y.price && x.cat == y.cat)
                     && b1.iter().zip(&b3).all(|(x, y)| x.eh == y.eh && x.eh2 == y.eh2 && x.ing == y.ing && x.loc == y.loc);
                 assert!(same, "parse_event_chunk3 differs on chunk {ci} cut {cut}");
                 cks += 1;
@@ -2836,6 +2954,9 @@ last,b,c,d,e,f,g"#
     let pay_refs: Vec<&[UEv]> = pays.iter().map(|v| v.as_slice()).collect();
     let is_winner = |c: usize, i: usize| bits[c][i / 64].load(std::sync::atomic::Ordering::Relaxed) >> (i % 64) & 1 == 1;
     let wc: Vec<Vec<u32>> = wcount.into_iter().map(|v| v.into_iter().map(|a| a.into_inner()).collect()).collect();
+    // winners per (chunk, user shard): the user shuffle lays each shard out chunk by chunk, so
+    // resolve recovers every record's chunk (needed to turn its uoff into bytes) from these
+    let wc_keep = wc.clone();
     let (mut uev_all, uev_off) = partition_counted(&pay_refs, Some(wc), is_winner, |e: &UEv| shard_h(e.pk));
     drop(pay_refs);
     drop(pays);
@@ -2848,10 +2969,11 @@ last,b,c,d,e,f,g"#
         .map(|&c| {
             let mut sh: Vec<UCl> = Vec::with_capacity(c.len() / 40 + 16);
             let mut cc = vec![0u32; NSH];
-            scan_lines2::<4>(c, |r| {
+            let mut mc = MonthCache::new();
+            scan_lines3::<4>(c, |r| {
                 let Some([Some(cid), Some(uid), Some(camp), ts]) = r else { return };
                 let Some(&camp) = campaigns.get(camp) else { return };
-                let ts = parse_ts(ts);
+                let ts = mc.f1(ts); // ISO ...Z via the month cache; any other form -> parse_ts
                 if ts == BAD || ts < ws - WEEK || ts >= we {
                     return;
                 }
@@ -2894,16 +3016,16 @@ last,b,c,d,e,f,g"#
                 assert!(local < PL_MASK, "too many people in one shard");
                 ((shi as u32) << PL_BITS) | local
             };
-            let mut pid_of = |u: B, uh: u64, u2: u64| -> u32 {
+            let mut pid_of = |u: NameRef, uh: u64, u2: u64| -> u32 {
                 let u2 = u2 as u32 as u64; // 96-bit user identity: h64 + low 32 bits of h2
                 if lk_clash {
-                    if let Some(i) = it.get(u, uh) {
+                    if let Some(i) = it.get(name_of_ref(u), uh) {
                         return rootv[i as usize];
                     }
                     if let Some(&p) = side.get(&(uh, u2)) {
                         return p;
                     }
-                    let p = new_unlinked(u, &mut unl_names);
+                    let p = new_unlinked(name_of_ref(u), &mut unl_names);
                     side.insert((uh, u2), p);
                     return p;
                 }
@@ -2917,31 +3039,35 @@ last,b,c,d,e,f,g"#
                         if let Some(&p) = side.get(&(uh, u2)) {
                             return p;
                         }
-                        let p = new_unlinked(u, &mut unl_names);
+                        let p = new_unlinked(name_of_ref(u), &mut unl_names);
                         side.insert((uh, u2), p);
                         p
                     }
                     std::collections::hash_map::Entry::Vacant(v) => {
-                        let p = new_unlinked(u, &mut unl_names);
+                        let p = new_unlinked(name_of_ref(u), &mut unl_names);
                         v.insert((u2, p));
                         p
                     }
                 }
             };
             let evs = &uev_all[uev_off[shi]..uev_off[shi + 1]];
-            let prs: Vec<PR> = evs
-                .iter()
-                .map(|e| PR {
-                    key: ((pid_of(e.name(), e.pk, e.pk2 as u64) as u64) << 32) | e.ts as u64,
-                    price: e.price,
-                    cat: e.cat,
-                })
-                .collect();
+            let mut prs: Vec<PR> = Vec::with_capacity(evs.len());
+            let mut pos = 0usize;
+            for (c, counts) in wc_keep.iter().enumerate() {
+                let n = counts[shi] as usize;
+                let base = ev_chunks[c].as_ptr() as usize;
+                for e in &evs[pos..pos + n] {
+                    let pid = pid_of(NameRef::Scan(base + e.uoff as usize), e.pk, e.pk2 as u64);
+                    prs.push(PR { key: ((pid as u64) << 32) | e.ts as u64, price: e.price, cat: e.cat });
+                }
+                pos += n;
+            }
+            assert!(pos == evs.len(), "user shuffle layout");
             let cls = &ucl_all[ucl_off[shi]..ucl_off[shi + 1]];
             let crs: Vec<CR> = cls
                 .iter()
                 .map(|c| CR {
-                    key: ((pid_of(unpack_ref(c.uref), c.uh, c.uh2 as u64) as u64) << 32) | c.ts as u64,
+                    key: ((pid_of(NameRef::Packed(c.uref), c.uh, c.uh2 as u64) as u64) << 32) | c.ts as u64,
                     camp: c.camp,
                     cref: c.cref,
                 })
@@ -2989,13 +3115,15 @@ last,b,c,d,e,f,g"#
     drop(crs_parts);
     lap("events regrouped");
     // per person-shard: sessionize, attribute, aggregate
+    // 40-byte output row (was 56): counts fit u32 (at most the event count); NO_TOP = no purchase
+    const NO_TOP: u32 = u32::MAX - 1;
     struct URow {
         name: B,
-        day: i32,
-        sessions: i64,
-        events: i64,
         revenue: i64,
-        top: Option<u32>,
+        day: i32,
+        sessions: u32,
+        events: u32,
+        top: u32,
     }
     let pev_slices = shard_slices(&mut pev_all, &pev_off);
     let pcl_slices = shard_slices(&mut pcl_all, &pcl_off);
@@ -3131,11 +3259,11 @@ last,b,c,d,e,f,g"#
                             urows.push(finish(r, &mut cats, &cat_names));
                         }
                         cur_day = day;
-                        row = Some(URow { name, day, sessions: 0, events: 0, revenue: 0, top: None });
+                        row = Some(URow { name, day, sessions: 0, events: 0, revenue: 0, top: NO_TOP });
                     }
                     let r = row.as_mut().unwrap();
                     r.sessions += 1;
-                    r.events += n;
+                    r.events += n as u32;
                     r.revenue += rev;
                     for x in &evs[k..e] {
                         if x.price > 0 {
@@ -3199,7 +3327,7 @@ last,b,c,d,e,f,g"#
                 }
             };
         }
-        r.top = best.map(|b| b.0);
+        r.top = best.map_or(NO_TOP, |b| b.0);
         cats.clear();
         r
     }
@@ -3247,10 +3375,10 @@ last,b,c,d,e,f,g"#
             &[
                 ("user_id", pq::Col::Str(rows.iter().map(|r| Some(r.name)).collect(), false)),
                 ("day", pq::Col::Date(rows.iter().map(|r| r.day).collect())),
-                ("sessions", pq::Col::I64(rows.iter().map(|r| r.sessions).collect())),
-                ("events", pq::Col::I64(rows.iter().map(|r| r.events).collect())),
+                ("sessions", pq::Col::I64(rows.iter().map(|r| r.sessions as i64).collect())),
+                ("events", pq::Col::I64(rows.iter().map(|r| r.events as i64).collect())),
                 ("revenue_cents", pq::Col::I64(rows.iter().map(|r| r.revenue).collect())),
-                ("top_category", pq::Col::Str(rows.iter().map(|r| r.top.map(cat_name)).collect(), true)),
+                ("top_category", pq::Col::Str(rows.iter().map(|r| if r.top == NO_TOP { None } else { Some(cat_name(r.top)) }).collect(), true)),
             ],
         )
         .expect("write user_daily");
