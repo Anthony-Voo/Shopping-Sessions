@@ -170,3 +170,8 @@ Observation (Nov 21 ~14:00): micro-level CPU cuts (sliding masks, ts cache, camp
 byte cuts (P1 20 B keys, H2 26 B PEv) also tied alone but won when stacked. Remaining wins come from stacking exact near-ties.
 Ideas next: G11 PR/PEv price+cat in one u32 when ncat < 255 (fallback: current layout via const generic) ; G12 dedup key 20 B (P1) restacked on v52 ;
 G13 sessionize: skip the click radix entirely for persons with 0/1 clicks (most), sort clicks per person only when >1 ; G14 write stage overlap with sessionize.
+| G12 | 20 B dedup key restacked on v52 | median (24 runs) | 12/24 pairs | tie, reverted (main.g12k20.rs, exact) |
+| G13 | researcher #1: atomic bitset dedup filter (microbench, 20.8M ids, 4 threads) | key tail + dedup 0.145 s | insert 0.12 s (prefetched) + test 0.06 s, 8-13% candidates left | rejected: costs more than it replaces |
+| G14 | researcher #4: shard count at 60M (SH_BITS 8 vs 10, 8 interleaved runs on p60m) | 4.524 s | 4.521 s (6/8) | tie: 256 shards are fine for the final |
+| G15 | fork-and-report fast exit (parent exits when outputs are written; child tears down 2 GB) | native: written->exit gap 0.04-0.05 s (20M), 0.07-0.10 s (60M); docker run median 1.918 (20 rounds) | 1.914 (9/20) | tie under docker (container end waits for the child): reverted (main.g15fx.rs) |
+Note: docker works here (start dockerd; base images from local shopping-sessions:latest, Docker Hub rate-limited). Docker-level timing: scratchpad/dimg.
