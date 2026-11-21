@@ -932,6 +932,137 @@ fn parse_event_chunk4(
     (pay, keys, kcount, ucount)
 }
 
+fn parse_event_chunk5(
+    chunk: &'static [u8],
+    ci: usize,
+    ws: i64,
+    we: i64,
+    products: &FxHashMap<B, u32>,
+) -> (Vec<PEv>, Vec<DKey>, Vec<u32>, Vec<u32>) {
+    let n = chunk.len();
+    assert!(n < (1 << 31), "chunk too large for the structural index");
+    let cap = n / 64 + 16;
+    let mut pay: Vec<PEv> = Vec::with_capacity(cap);
+    let mut keys: Vec<DKey> = Vec::with_capacity(cap);
+    let mut kcount = vec![0u32; NSH];
+    let mut ucount = vec![0u32; NSH]; // valid payloads per user shard
+    let mut cm = [0usize; 8];
+    let mut mc = MonthCache::new();
+    let mut pad = [0u8; 64];
+    // per-line structural scan: from each line start, load 64 B blocks and take the newline,
+    // comma and quote positions straight from the masks (no separator index array)
+    let mut next_start = 0usize;
+    while next_start < n {
+        let line_start = next_start;
+        let mut k = 0usize;
+        let mut nq = 0u32;
+        let mut off = line_start;
+        let end;
+        loop {
+            let blk: &[u8] = if off + 64 <= n {
+                &chunk[off..off + 64]
+            } else {
+                pad = [0u8; 64];
+                pad[..n - off].copy_from_slice(&chunk[off..n]);
+                &pad
+            };
+            let (c, nl, q) = block_masks(blk);
+            let below = if nl != 0 { (1u64 << nl.trailing_zeros()) - 1 } else { u64::MAX };
+            let mut cmask = c & below;
+            nq += (q & below).count_ones();
+            while cmask != 0 {
+                if k < 8 {
+                    cm[k] = off + cmask.trailing_zeros() as usize;
+                }
+                k += 1;
+                cmask &= cmask - 1;
+            }
+            if nl != 0 {
+                end = off + nl.trailing_zeros() as usize;
+                break;
+            }
+            off += 64;
+            if off >= n {
+                end = n;
+                break;
+            }
+        }
+        next_start = end + 1;
+        if k != 6 {
+            continue;
+        }
+        // field k spans [fs_k, fe_k); strip quotes around whole fields; validate the quote count
+            let mut fb = [(0usize, 0usize); 7];
+            let mut pairs = 0u32;
+            let mut fs = line_start;
+            for k in 0..7 {
+                let fe = if k < 6 { cm[k] } else { end };
+                let flen = fe - fs;
+                let first = *chunk.get(fs).unwrap_or(&0);
+                let last = *chunk.get(fe.wrapping_sub(1).max(fs)).unwrap_or(&0);
+                let isq = ((nq > 0) & (flen >= 2) & (first == b'"') & (last == b'"')) as usize;
+                pairs += isq as u32;
+                fb[k] = (fs + isq, fe - isq);
+                fs = fe + 1;
+            }
+            if nq != 2 * pairs {
+                continue; // a quote that is not around a whole field
+            }
+            let field = |k: usize| -> Option<B> {
+                let (a, b) = fb[k];
+                if a < b { Some(&chunk[a..b]) } else { None }
+            };
+            let Some(eid) = field(0) else { continue };
+            let ing = mc.f1(field(3));
+            let ts = parse_ts_over(field(2));
+            let uid = field(1);
+            let kind = event_kind(field(4));
+            let pid = field(5);
+            let mut ok = uid.is_some() && pid.is_some() && kind < 3 && ts != BAD && ts >= ws && ts < we;
+            let mut p = 0u32;
+            let mut cat = 0u16;
+            if ok && kind == 2 {
+                match parse_price(field(6)) {
+                    Some(v) => {
+                        p = v as u32;
+                        cat = match products.get(pid.unwrap()) {
+                            Some(&c) => c as u16,
+                            None => u16::MAX,
+                        };
+                    }
+                    None => ok = false,
+                }
+            }
+            if ok && ing - ts > DAY {
+                ok = false;
+            }
+            let mut idx = u32::MAX as u64;
+            let mut ush = 0u64;
+            if ok {
+                let u = uid.unwrap();
+                idx = pay.len() as u64;
+                let (uh, uh2) = h12_over(u);
+                ush = shard_h(uh) as u64;
+                ucount[ush as usize] += 1;
+                assert!(u.len() <= 0xFFFF && (u.as_ptr() as u64) < (1 << 48), "user_id reference does not pack");
+                pay.push(PEv {
+                    pk: uh,
+                    nref: (u.as_ptr() as u64) | ((u.len() as u64) << 48),
+                    pk2: uh2 as u32,
+                    ts: (ts - ws) as u32,
+                    price: p,
+                    cat,
+                });
+            }
+            let (eh, eh2) = h12_over(eid);
+            kcount[shard_h(eh)] += 1;
+            // ingest_ts is always F1 (whole seconds); +-68 years around the window fits in i32
+            let ing_s = (ing.div_euclid(1000) - ws.div_euclid(1000)).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            keys.push(DKey { eh, eh2: eh2 as u32, ing: ing_s, loc: (ush << 48) | ((ci as u64) << 32) | idx });
+    }
+    (pay, keys, kcount, ucount)
+}
+
 
 
 /// Split a line into exactly N fields; None if malformed. One pass over the bytes.
@@ -1510,6 +1641,27 @@ fn partition_counted<T: Copy + Send + Sync>(
 
 /// Like partition_counted; the output's allocation is at least `min_bytes` so that a later
 /// stage can reuse the same (already faulted-in) block through the recycling allocator.
+/// Copy `lines` x 64 bytes (unaligned) with full-width vector moves.
+#[inline(always)]
+unsafe fn copy_lines(src: *const u8, dst: *mut u8, lines: usize) {
+    #[cfg(target_feature = "avx512f")]
+    {
+        use std::arch::x86_64::{__m512i, _mm512_loadu_si512, _mm512_storeu_si512};
+        for l in 0..lines {
+            // SAFETY: caller guarantees both ranges hold lines*64 bytes and do not overlap
+            unsafe {
+                let v = _mm512_loadu_si512(src.add(64 * l) as *const __m512i);
+                _mm512_storeu_si512(dst.add(64 * l) as *mut __m512i, v);
+            }
+        }
+    }
+    #[cfg(not(target_feature = "avx512f"))]
+    // SAFETY: as above
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, lines * 64)
+    };
+}
+
 fn partition_sized<T: Copy + Send + Sync>(
     parts: &[&[T]],
     known: Option<Vec<Vec<u32>>>,
@@ -1551,7 +1703,25 @@ fn partition_sized<T: Copy + Send + Sync>(
     // software write-combining: stage each shard's elements in a ~256 B buffer (all buffers
     // together ~256 KB, L2-resident) and flush full buffers as one contiguous burst, so the
     // 1024-way scatter costs one TLB/cache miss per burst instead of one per element
-    let e = (256 / std::mem::size_of::<T>().max(1)).max(1);
+    // burst = smallest whole number of 64 B lines (>= 192 B) holding whole elements, fixed at
+    // compile time, so each flush is a few inline 64 B vector moves rather than a memcpy call
+    let e: usize = const {
+        let sz = std::mem::size_of::<T>();
+        assert!(sz > 0);
+        let (mut a, mut b) = (sz, 64usize);
+        while b != 0 {
+            let t = a % b;
+            a = b;
+            b = t;
+        }
+        let base = 64 / a;
+        let mut n = base;
+        while n * sz < 192 {
+            n += base;
+        }
+        n
+    };
+    let lines: usize = const { 0 } + e * std::mem::size_of::<T>() / 64;
     parts.par_iter().zip(starts.into_par_iter()).enumerate().for_each_init(
         || (Vec::<T>::with_capacity(NSH * e), vec![0u16; NSH]),
         |(buf, fill), (pi, (v, mut pos))| {
@@ -1566,7 +1736,7 @@ fn partition_sized<T: Copy + Send + Sync>(
                 unsafe { bp.add(k * e + f).write(*x) };
                 if f + 1 == e {
                     // SAFETY: each (chunk, shard) owns the disjoint range [starts, starts+count)
-                    unsafe { std::ptr::copy_nonoverlapping(bp.add(k * e), ptr.0.add(pos[k]), e) };
+                    unsafe { copy_lines(bp.add(k * e) as *const u8, ptr.0.add(pos[k]) as *mut u8, lines) };
                     pos[k] += e;
                     fill[k] = 0;
                 } else {
@@ -1956,6 +2126,14 @@ last,b,c,d,e,f,g"#
                         && b4.iter().zip(&b3).all(|(x, y)| x.eh == y.eh && x.eh2 == y.eh2 && x.ing == y.ing && x.loc == y.loc),
                     "parse_event_chunk4 differs on chunk {ci} cut {cut}"
                 );
+                let (a5, b5, k5, u5) = parse_event_chunk5(c, ci, ws, we, &prods);
+                let (_, _, _, u4) = parse_event_chunk4(c, ci, ws, we, &prods);
+                assert!(
+                    a5.len() == a4.len() && b5.len() == b4.len() && k5 == k4 && u5 == u4
+                        && a5.iter().zip(&a4).all(|(x, y)| x.pk == y.pk && x.nref == y.nref && x.pk2 == y.pk2 && x.ts == y.ts && x.price == y.price && x.cat == y.cat)
+                        && b5.iter().zip(&b4).all(|(x, y)| x.eh == y.eh && x.eh2 == y.eh2 && x.ing == y.ing && x.loc == y.loc),
+                    "parse_event_chunk5 differs on chunk {ci} cut {cut}"
+                );
                 let same = a1.len() == a3.len()
                     && b1.len() == b3.len()
                     && k1 == k3
@@ -2037,7 +2215,7 @@ last,b,c,d,e,f,g"#
     let per_chunk: Vec<(Vec<UEv>, Vec<DKey>, Vec<u32>, Vec<u32>)> = ev_chunks
         .par_iter()
         .enumerate()
-        .map(|(ci, &c)| parse_event_chunk4(c, ci, ws, we, &products))
+        .map(|(ci, &c)| parse_event_chunk5(c, ci, ws, we, &products))
         .collect();
     lap("  parse lines");
     let mut pays: Vec<Vec<UEv>> = Vec::with_capacity(per_chunk.len());
