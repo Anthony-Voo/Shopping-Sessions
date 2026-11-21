@@ -2041,6 +2041,55 @@ fn radix_lo32<T: Copy>(a: &mut [T], b: &mut [T], key: impl Fn(&T) -> u32, mut ho
     }
 }
 
+/// Stable LSD radix sort of `a` by `key` (< 2^22) in two 11-bit passes; `b` is scratch and the
+/// result ends back in `a`. `hook` sees every record once in the histogram pass.
+fn radix_22<T: Copy>(a: &mut [T], b: &mut [T], key: impl Fn(&T) -> u32, mut hook: impl FnMut(&T)) {
+    const D: usize = 2048;
+    let mut h = vec![0u32; 2 * D];
+    for r in a.iter() {
+        hook(r);
+        let k = key(r);
+        h[(k & 2047) as usize] += 1;
+        h[D + (k >> 11) as usize] += 1;
+    }
+    for p in 0..2 {
+        let mut s = 0u32;
+        for c in h[p * D..(p + 1) * D].iter_mut() {
+            let n = *c;
+            *c = s;
+            s += n;
+        }
+    }
+    for r in a.iter() {
+        let d = (key(r) & 2047) as usize;
+        b[h[d] as usize] = *r;
+        h[d] += 1;
+    }
+    for r in b.iter() {
+        let d = D + (key(r) >> 11) as usize;
+        a[h[d] as usize] = *r;
+        h[d] += 1;
+    }
+}
+
+/// Insertion sort for nearly sorted slices (here: already sorted by ts >> 9).
+#[inline]
+fn insertion_fix<T: Copy>(v: &mut [T], k: impl Fn(&T) -> u64) {
+    for i in 1..v.len() {
+        let x = v[i];
+        let kx = k(&x);
+        if k(&v[i - 1]) <= kx {
+            continue;
+        }
+        let mut j = i;
+        while j > 0 && k(&v[j - 1]) > kx {
+            v[j] = v[j - 1];
+            j -= 1;
+        }
+        v[j] = x;
+    }
+}
+
 #[inline]
 fn shard_pid(pid: u32) -> usize {
     ((pid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SH_BITS)) as usize
@@ -3231,14 +3280,14 @@ last,b,c,d,e,f,g"#
             // whole-shard stable radix sort by ts (3 passes, ends in eg; the person count rides on
             // its histogram pass), then a stable counting sort by person back into evin: every
             // person's events come out ordered by time with no per-person sort
-            radix_lo32(evin, &mut eg, |r: &PR| r.key as u32, |r: &PR| eoff[li(r.key) + 1] += 1);
+            radix_22(evin, &mut eg, |r: &PR| (r.key as u32) >> 9, |r: &PR| eoff[li(r.key) + 1] += 1);
             for p in 0..np {
                 eoff[p + 1] += eoff[p];
             }
             let mut pos = eoff.clone();
-            for r in eg.iter() {
+            for r in evin.iter() {
                 let l = li(r.key);
-                evin[pos[l] as usize] = *r;
+                eg[pos[l] as usize] = *r;
                 pos[l] += 1;
             }
             let mut coff = vec![0u32; np + 1];
@@ -3246,14 +3295,14 @@ last,b,c,d,e,f,g"#
             let mut cg: Vec<CR> = Vec::with_capacity(ncl);
             // SAFETY: every slot in 0..ncl is written exactly once below
             unsafe { cg.set_len(ncl) };
-            radix_lo32(cls, &mut cg, |c: &CR| c.key as u32, |c: &CR| coff[li(c.key) + 1] += 1);
+            radix_22(cls, &mut cg, |c: &CR| (c.key as u32) >> 9, |c: &CR| coff[li(c.key) + 1] += 1);
             for p in 0..np {
                 coff[p + 1] += coff[p];
             }
             let mut cpos = coff.clone();
-            for c in cg.iter() {
+            for c in cls.iter() {
                 let l = li(c.key);
-                cls[cpos[l] as usize] = *c;
+                cg[cpos[l] as usize] = *c;
                 cpos[l] += 1;
             }
             let mut cats: Vec<(u32, i64)> = vec![];
@@ -3262,16 +3311,21 @@ last,b,c,d,e,f,g"#
             let mut acnt: Vec<u32> = vec![0; ncamp];
             let mut apos: Vec<u32> = vec![0; ncamp];
             let mut alist: Vec<u32> = Vec::new();
+            // lazy assists: a campaign's assisted count for a day is added when it leaves the window
+            // or the day changes (sessions since enter[c]), not once per session
+            let mut enter: Vec<u32> = vec![0; ncamp];
             for p in 0..np {
                 if eoff[p] == eoff[p + 1] {
                     continue; // no events: this person has no sessions
                 }
                 let (e0, e1) = (eoff[p] as usize, eoff[p + 1] as usize);
-                let evs = &evin[e0..e1];
+                insertion_fix(&mut eg[e0..e1], |r: &PR| r.key);
+                let evs = &eg[e0..e1];
                 // clicks: by ts ascending; equal ts ordered by click_id DESCENDING so the last
                 // eligible click is the winner (latest ts, then smallest click_id): fix equal-ts runs
                 let (c0, c1) = (coff[p] as usize, coff[p + 1] as usize);
-                let pcl = &mut cls[c0..c1];
+                let pcl = &mut cg[c0..c1];
+                insertion_fix(pcl, |c: &CR| c.key);
                 let mut eq = false;
                 for w in pcl.windows(2) {
                     let (a, b) = (w[0].key, w[1].key);
@@ -3303,6 +3357,7 @@ last,b,c,d,e,f,g"#
                     acnt[c as usize] = 0;
                 }
                 alist.clear();
+                let mut sc = 0u32; // sessions of this person so far
                 let mut cur_day = i32::MIN;
                 let mut row: Option<URow> = None;
                 let mut k = i;
@@ -3330,6 +3385,12 @@ last,b,c,d,e,f,g"#
                         if let Some(r) = row.take() {
                             urows.push(finish(r, &mut cats, &cat_names));
                         }
+                        if cur_day != i32::MIN {
+                            for &c in &alist {
+                                camp[cidx(c, cur_day)].assisted += sc - enter[c as usize];
+                                enter[c as usize] = sc;
+                            }
+                        }
                         cur_day = day;
                         row = Some(URow { name, day, sessions: 0, events: 0, revenue: 0, top: NO_TOP });
                     }
@@ -3352,6 +3413,7 @@ last,b,c,d,e,f,g"#
                         if acnt[c] == 0 {
                             apos[c] = alist.len() as u32;
                             alist.push(c as u32);
+                            enter[c] = sc;
                         }
                         acnt[c] += 1;
                         hi += 1;
@@ -3360,6 +3422,7 @@ last,b,c,d,e,f,g"#
                         let c = pcl[lo].camp as usize;
                         acnt[c] -= 1;
                         if acnt[c] == 0 {
+                            camp[cidx(c as u32, day)].assisted += sc - enter[c];
                             let k = apos[c] as usize;
                             let last = *alist.last().unwrap();
                             alist[k] = last;
@@ -3373,10 +3436,11 @@ last,b,c,d,e,f,g"#
                     a.sessions += 1;
                     a.purchasing += purch as u32;
                     a.rev += rev;
-                    for &c in &alist {
-                        camp[cidx(c, day)].assisted += 1;
-                    }
+                    sc += 1;
                     k = e;
+                }
+                for &c in &alist {
+                    camp[cidx(c, cur_day)].assisted += sc - enter[c as usize];
                 }
                 if let Some(r) = row.take() {
                     urows.push(finish(r, &mut cats, &cat_names));
