@@ -40,3 +40,6 @@ v54 vs v51 (24 interleaved runs, 20M): wall 1.444 -> 1.353 s (-6.3%), CPU -6.9%;
 
 ## Optional board experiment (prepared Nov 21 ~15:35 UTC)
 Branch exp-sh10, SHA 7d7abd0 = v54 with 1024 shards. Same output as v54. This VM has 2 MB L2 / 260 MB L3, the scorer ~1 MB L2 and a small L3, so smaller shards may help there (locally a slight loss at 60M). Submit by SHA only if a spare submission is available; compare with v54 (main 850b4d3).
+
+## Nov 21 ~22:20 UTC: main fast-forwarded to b8cf964 (v58 = v57 + PGO)
+vs v54 (both rustc 1.90): 20M pooled 36/48 wall, 38/48 cpu faster (sets -0.4% / -4.9%); 60M -2% wall, -3% cpu; output identical. Docker image (rust:1.90-slim + pgo/merged.profdata) builds and matches the dev answer. Not yet submitted.
