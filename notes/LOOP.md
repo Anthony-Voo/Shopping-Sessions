@@ -185,3 +185,6 @@ Note: docker works here (start dockerd; base images from local shopping-sessions
 | diag | huge-page faults per run (vmstat thp_fault_alloc): 948 x 2 MB = 1.9 GB zeroed = anon peak -> allocator reuse is complete; zeroing (6% of CPU) only shrinks with peak memory. Peak is at "events parsed" (payloads + per-chunk keys + partitioned keys); the fused-key fix was tried 3x (v23b, v34, v43y): tie/worse | — | — | — |
 | G19 | Parquet pages pre-sized exactly (no regrowth) | write lap 0.0665 | 0.0705 (7/16) | tie, reverted |
 | G20 | user_daily sessions/events as INT32 (rules: any integer width; counts < 2^31); output 93 -> 76 MB | write lap 0.0640, total 1.339 (16) | 0.0595 (10/16), total noise | exact (gate + seed 194): IN STACK |
+| diag | links thread uncontended (NCPU=1): parse 0.045, hash 0.015, intern+union-find 0.133, rootv 0.012, roots 0.016, lks 0.04 = 0.26 s CPU | — | — | — |
+| G21 | links: fast line scanner + 8-byte big-endian name prefixes for the union-find order (equal prefixes -> full compare) | links thread 0.272 s | 0.226-0.267 s | exact (gate + seeds 195-196) |
+| stack | G20 + G21 vs v53, 24 runs | wall 1.372 / cpu 5.120 | 1.376 / 5.130 (14/24) | tie: parked (scratchpad/stack_g20_g21.patch), src back to v53 |
