@@ -22,7 +22,7 @@ const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const BAD: i64 = i64::MIN; // unparseable timestamp
 const HUGE: i64 = i64::MAX; // F3 too long for i64: valid form, outside every window
-const SH_BITS: u32 = 8; // shard count = 2^SH_BITS
+const SH_BITS: u32 = 10; // shard count = 2^SH_BITS
 const NSH: usize = 1 << SH_BITS;
 const PL_BITS: u32 = 32 - SH_BITS; // person id = person shard << PL_BITS | index within the shard
 const PL_MASK: u32 = (1 << PL_BITS) - 1;
