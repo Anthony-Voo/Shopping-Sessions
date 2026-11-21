@@ -248,3 +248,4 @@ PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried 
 | R25 | parse: test the F1 timestamp shape first (58% of lines), F3/F2 after | 63.5-67.3 ns/line (6 rounds) | 63.3-67.0 (3/6) | tie: reverted (exact: gate, SELFTEST) |
 | R26 | parse: branch-free event_kind (one masked 8-byte load, cmov select) | 62.6-66.5 ns/line (6 rounds) | 63.1-68.2 (1/6) | slower: reverted (exact: gate + seed 226) |
 | R27 | parse: drop the legacy per-line uid len/ptr assert (uoff is chunk-relative, chunk < 2^31 asserted) | 62.4-69.1 ns/line (6 rounds) | 62.6-66.9 (2/6) | tie (predictable branch): reverted (exact: gate + seed 227) |
+| R28 | parse: hash the event id right after extracting it (multiply chain overlaps ts parsing) | parse 64.3-65.5 ns median; totals 1.309 / 1.362 / 1.268 | parse 63.0-63.2 (10/14 rounds); totals 1.271 (19/24) / 1.357 (12/24) / 1.282 (4/24) | parse -2% but total tie (35/72): reverted (exact: gate + seed 228) |
