@@ -349,3 +349,15 @@ PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried 
   from the rows into one reused buffer (pq Col::Fill; no per-column value vectors): 0.161/0.54 -> 0.138/0.50 (-14%).
 - COMBINED v63 (after all stages, per the user's rule): exact (SELFTEST, gate, seeds 256 257 9202 517 518, v5 dev, full 20M outputs = v62).
   stimer 12 rounds vs v62: v5 n60 -1.7% (5/12), v5 n20 -6.3% (8/12, 7/12 >3%); cpuab 8 rounds n60: cpu 14.54 -> 14.24 (-2.1%), wall -2.7%.
+
+## Nov 22 06:00-08:45 UTC: parser-only experiments on v63 (all exact, none kept)
+- SIMD of the existing hash (h12x8: 128-bit products from 4 mul_epu32): bit-identical (2.84M fuzz ids) but 59.0 -> 61.1 ns/line.
+- Branchless event_kind: 60.1 -> 61.8. Parse chunk 16/64 MB, prefetch 1/4 KB: ties (one 64 MB run -9%, not reproduced).
+- Precomputed line starts per window (break the line-to-line chain): 64 KB 61.6 -> 75.3, 4 KB 61.0 -> 68.7 ns/line.
+- Container start: v63 image 0.228 s on a tiny input vs 0.007 s bare; debian vs scratch static: no difference (0.216-0.228 s).
+- Leaders (read their public READMEs, no code copied): Team 67 "Express Lane" design, adopted by many teams: recover the
+  generator's per-seed ID scramble keys from a sample, decode event ids to dense indices (direct-indexed dedup) and user ids to
+  (person, alias) by arithmetic. v5 rules say ids must be treated as opaque, not invertible generator numbers: not adopted.
+- Packed exact ID keys (<= 10 chars [0-9A-Za-z_], 6 bits each, fmix64 bijection; long ids keep the hash, h2 low bit set):
+  exact (SELFTEST, gate). scalar packer 186 ns/line; SSE+pext with copy 107; AVX-512 masked load + pext 63.5 vs 59.1 (p20m),
+  70.5 vs 67.7 (v5 n20): slower, reverted (patch: scratchpad packed_ids.patch).
