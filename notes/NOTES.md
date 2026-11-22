@@ -101,3 +101,8 @@ organizers' stated ~20% machine-to-machine spread; locally v63 is 2% faster at 2
   4.023 -> 3.848 (+4.4%), 4/5 clean pairs; 20M +5.4% (6/12). Ingest gather tweak on top: +3.1% (7/12), parse lines 1.433 -> 1.332.
 - PGO retrain for this source: inconclusive/noisy (one set, 1 clean pair); v63's profile kept, as every earlier retrain.
 - Final v65 binary vs v64, 60M 12 rounds: 4.585 -> 4.091 (+10.8%, 7/12), clean medians 4.076 -> 3.941 (+3.3%).
+- 20 B DKey, second form (chunk id dropped from loc and recovered from the key's position in the shard slice via the
+  per-chunk counts; user shard kept in loc, so no loser payload reads): exact (SELFTEST, 20M tables == v63), peak RSS
+  11.77 -> 11.45 GB, but 60M vs v65: 4/12, dedup 0.245 -> 0.302, parse lines 1.36 -> 1.43 (misaligned 20 B records),
+  clean total -1.4%. Dropped (patch: /tmp/claude-0/dkey20_pos.patch on this VM). A 16 B key is not reachable exactly:
+  ing is needed for invalid copies (no payload) and eh2 keeps the 96-bit identity.
