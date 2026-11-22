@@ -154,3 +154,9 @@ organizers' stated ~20% machine-to-machine spread; locally v63 is 2% faster at 2
   2 of 3 clean pairs); peak RSS 11.76 -> 11.64 GB.
 - Exact: gate PASS (hash line skipped), SELFTEST, difftests 616 (Apr -> May) and 661 MATCH, 20M and 60M MATCH v66,
   adversarial set (data/edge-bucket) MATCH the oracle at NCPU=8 and 1, dev MATCH at NCPU=3.
+- v68 PGO retrain (ws/pgo.sh recipe on this source): 60M 12 rounds vs the committed profile: 6/12, +0.01% all runs, +0.7% clean:
+  tie, committed (v63) profile kept.
+- 20M (v5, warm, NCPU=8, interleaved): v66 1.187 -> v68 1.117 s (+5.9%, 12/16; sessionize 0.228 -> 0.159);
+  v63 1.223 -> v68 1.082 s (+11.5%, 11/12). 60M clean medians in the last set: v68 3.70 s (v63 was ~4.25, v66 ~4.2).
+- The kit's checker (scripts/run_fixtures.py load_actual) reads each part with polars, casts integers to Int128 and accepts
+  String / Categorical / Enum for strings, so dictionary pages and INT32 revenue go through the same loader the gate uses.
