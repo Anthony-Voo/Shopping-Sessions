@@ -54,3 +54,10 @@ vs v54 (both rustc 1.90): 20M pooled 36/48 wall, 38/48 cpu faster (sets -0.4% / 
 ## Board after the scorer fix (scorer version shopping-sessions-5), read Nov 22 02:34 UTC 
 Goonies #5 at 0.9663 s (user report + board). Leader "today is yesterday's tomorrow" 0.7257, #2 Fraun 0.8661, #3 hillclimbers 0.9224, #4 Jitesh Rao 0.9619, #6 electrum 0.9688, #7 BingBU 0.9730.
 Assumed to be the frozen commit 5b5058b (v59). Local warm NCPU8 20M median 1.223 s -> board/local ~0.79 (was ~0.87 before the fix).
+
+## Nov 22 ~03:20 UTC: candidate v60 = bf91689482893c7f9d84fbd7fa7428e46f27d77d (dev)
+- Organizer change (Sat 9:08 PM ET): v5 IDs (per-seed keyed bijection, 1 in 8 ids with 32-char hex suffix); best entries rescored onto v5;
+  finals = top 30, 3 fresh 60M datasets, 9 interleaved runs. New rule: entries must be the team's own work (ours is).
+- v59 and v60 both exact on v5 data: v5 dev answer MATCH, oracle seeds 501-503 MATCH.
+- v60 vs v59: win where a window spans two months (60M -2.4%, 10/12 faster), tie otherwise. Clean build of bf91689 with
+  docker --network=none --no-cache OK; container output MATCH v5 dev answer. Not submitted (user submits).
