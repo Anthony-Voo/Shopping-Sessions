@@ -1045,6 +1045,9 @@ fn parse_event_chunk5(
     let mut ucount = vec![0u32; NSH]; // valid payloads per user shard
     let mut cm = [0usize; 8];
     let mut mc = MonthCache::new();
+    // lines wait in batches of 8 so their ts and ingest_ts are parsed eight at a time (ts8)
+    let mut bfb = [[(0usize, 0usize); 7]; 8];
+    let mut bn = 0usize;
     let mut pad = [0u8; 64];
     // per-line structural scan: from each line start, load 64 B blocks and take the newline,
     // comma and quote positions straight from the masks (no separator index array)
@@ -1171,13 +1174,96 @@ fn parse_event_chunk5(
             if nq != 2 * pairs {
                 continue; // a quote that is not around a whole field
             }
+            if fb[0].0 >= fb[0].1 {
+                continue; // no event_id
+            }
+            bfb[bn] = fb;
+            bn += 1;
+            if bn == 8 {
+                ev_batch(chunk, ci, ws, we, products, &bfb, bn, &mut mc, &mut pay, &mut keys, &mut kcount, &mut ucount);
+                bn = 0;
+            }
+    }
+    if bn > 0 {
+        ev_batch(chunk, ci, ws, we, products, &bfb, bn, &mut mc, &mut pay, &mut keys, &mut kcount, &mut ucount);
+    }
+    (pay, keys, kcount, ucount)
+}
+
+/// Finish a batch of up to 8 parsed lines (field bounds in bfb): both timestamps of all lines at
+/// once through ts8 (scalar parse for any form it does not decide), then each line in order.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn ev_batch(
+    chunk: &'static [u8],
+    ci: usize,
+    ws: i64,
+    we: i64,
+    products: &FxHashMap<B, u32>,
+    bfb: &[[(usize, usize); 7]; 8],
+    bn: usize,
+    mc: &mut MonthCache,
+    pay: &mut Vec<PEv>,
+    keys: &mut Vec<DKey>,
+    kcount: &mut [u32],
+    ucount: &mut [u32],
+) {
+    let get = |l: usize, k: usize| -> Option<B> {
+        let (a, b) = bfb[l][k];
+        if a < b { Some(&chunk[a..b]) } else { None }
+    };
+    let mut tsv = [0i64; 8];
+    let mut ingv = [0i64; 8];
+    #[cfg(all(target_feature = "avx512bw", target_feature = "avx512dq"))]
+    {
+        let (mut o, mut n, mut oi, mut ni) = ([0i64; 8], [0u64; 8], [0i64; 8], [0u64; 8]);
+        let mut hi = 0usize;
+        for l in 0..bn {
+            let (a, b) = bfb[l][2];
+            let (c, d) = bfb[l][3];
+            o[l] = a as i64;
+            oi[l] = c as i64;
+            n[l] = b.saturating_sub(a) as u64;
+            ni[l] = d.saturating_sub(c) as u64;
+            hi = hi.max(a).max(c);
+        }
+        let (dt, di) = if hi + 32 <= chunk.len() {
+            (ts8g::<true>(chunk.as_ptr(), &o, &n, &mut tsv), ts8g::<false>(chunk.as_ptr(), &oi, &ni, &mut ingv))
+        } else {
+            // the chunk ends within 32 bytes of a field: copy the words (zero padded)
+            let (mut w, mut wi) = ([[0u64; 8]; 4], [[0u64; 8]; 4]);
+            for l in 0..bn {
+                let x = ts_words(chunk, o[l] as usize);
+                let y = ts_words(chunk, oi[l] as usize);
+                for k in 0..4 {
+                    w[k][l] = x[k];
+                    wi[k][l] = y[k];
+                }
+            }
+            (ts8::<true>(&w, &n, &mut tsv), ts8::<false>(&wi, &ni, &mut ingv))
+        };
+        for l in 0..bn {
+            if (dt >> l) & 1 == 0 {
+                tsv[l] = parse_ts_over(get(l, 2));
+            }
+            if (di >> l) & 1 == 0 {
+                ingv[l] = mc.f1(get(l, 3));
+            }
+        }
+    }
+    #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512dq")))]
+    for l in 0..bn {
+        tsv[l] = parse_ts_over(get(l, 2));
+        ingv[l] = mc.f1(get(l, 3));
+    }
+    for l in 0..bn {
+            let fb = bfb[l];
             let field = |k: usize| -> Option<B> {
                 let (a, b) = fb[k];
                 if a < b { Some(&chunk[a..b]) } else { None }
             };
             let Some(eid) = field(0) else { continue };
-            let ing = mc.f1(field(3));
-            let ts = parse_ts_over(field(2));
+            let (ts, ing) = (tsv[l], ingv[l]);
             let uid = field(1);
             let kind = event_kind(field(4));
             let pid = field(5);
@@ -1228,7 +1314,6 @@ fn parse_event_chunk5(
             let ing_s = (ing.div_euclid(1000) - ws.div_euclid(1000)).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
             keys.push(DKey { eh, eh2: eh2 as u32, ing: ing_s, loc: (ush << 48) | ((ci as u64) << 32) | idx });
     }
-    (pay, keys, kcount, ucount)
 }
 
 #[inline(never)]
@@ -1629,6 +1714,194 @@ fn civil_fast(b: &[u8]) -> Option<i64> {
         return None;
     }
     Some((((base + d - 1) * 24 + h) * 60 + mi) * 60_000 + s * 1000)
+}
+
+/// Byte mask -> qword with 0xFF in each selected byte (compile-time constant at every use).
+const fn bytes_of(pat: u8) -> i64 {
+    let mut q = 0u64;
+    let mut k = 0;
+    while k < 8 {
+        if (pat >> k) & 1 == 1 {
+            q |= 0xFF << (8 * k);
+        }
+        k += 1;
+    }
+    q as i64
+}
+
+/// Qword holding byte `c` at each byte position selected by `pat`.
+const fn tmpl(pat: u8, c: u8) -> i64 {
+    let mut q = 0u64;
+    let mut k = 0;
+    while k < 8 {
+        if (pat >> k) & 1 == 1 {
+            q |= (c as u64) << (8 * k);
+        }
+        k += 1;
+    }
+    q as i64
+}
+
+/// Replicate a per-lane byte pattern (bit k = byte k) across the 8 lanes of a 64-bit byte mask.
+const fn rep8(pat: u8) -> u64 {
+    (pat as u64) * 0x0101_0101_0101_0101
+}
+
+/// Eight timestamp fields at once (AVX-512, no branch on the form). Lane l holds the field's bytes
+/// 0..8, 8..16, 16..24, 24..32 in w[0..4][l] (bytes past the field are whatever follows it; the
+/// caller only promises they are readable) and its length in n[l]. For every lane shaped like a
+/// 13-digit F3, a 20-byte "...Z" F1 or a 25-byte "...+HH:MM" F2 it writes out[l] = parse_ts of the
+/// field (BAD when invalid) and sets bit l of the result; other lanes must use parse_ts.
+/// ALL = false decides only F1 lanes (ingest_ts, which is F1 by the rules).
+#[cfg(all(target_feature = "avx512bw", target_feature = "avx512dq"))]
+#[inline(always)]
+fn ts8<const ALL: bool>(w: &[[u64; 8]; 4], n: &[u64; 8], out: &mut [i64; 8]) -> u8 {
+    use std::arch::x86_64::*;
+    // SAFETY: avx512 enabled; loads from the arrays
+    unsafe {
+        let ld = |a: &[u64; 8]| _mm512_loadu_si512(a.as_ptr() as *const __m512i);
+        ts8v::<ALL>(ld(&w[0]), ld(&w[1]), ld(&w[2]), ld(&w[3]), ld(n), out)
+    }
+}
+
+/// ts8 with the fields gathered straight from `base + off[l]` (every base + off[l] + 32 readable).
+#[cfg(all(target_feature = "avx512bw", target_feature = "avx512dq"))]
+#[inline(always)]
+fn ts8g<const ALL: bool>(base: *const u8, off: &[i64; 8], n: &[u64; 8], out: &mut [i64; 8]) -> u8 {
+    use std::arch::x86_64::*;
+    // SAFETY: avx512 enabled; the caller guarantees base + off[l] + 32 is readable for every lane
+    unsafe {
+        let o = _mm512_loadu_si512(off.as_ptr() as *const __m512i);
+        let g = |k: usize| _mm512_i64gather_epi64::<1>(o, base.add(8 * k) as *const i64);
+        ts8v::<ALL>(g(0), g(1), g(2), g(3), _mm512_loadu_si512(n.as_ptr() as *const __m512i), out)
+    }
+}
+
+#[cfg(all(target_feature = "avx512bw", target_feature = "avx512dq"))]
+#[inline(always)]
+fn ts8v<const ALL: bool>(v0: std::arch::x86_64::__m512i, v1: std::arch::x86_64::__m512i, v2: std::arch::x86_64::__m512i, v3: std::arch::x86_64::__m512i, vn: std::arch::x86_64::__m512i, out: &mut [i64; 8]) -> u8 {
+    use std::arch::x86_64::*;
+    // SAFETY: avx512bw/dq are enabled for this build; the only store is to `out`
+    unsafe {
+        let set = |x: i64| _mm512_set1_epi64(x);
+        let z = _mm512_set1_epi8(b'0' as i8);
+        let ten = _mm512_set1_epi8(10);
+        let (d0, d1, d2, d3) = (_mm512_sub_epi8(v0, z), _mm512_sub_epi8(v1, z), _mm512_sub_epi8(v2, z), _mm512_sub_epi8(v3, z));
+        let (g0, g1, g2) = (_mm512_cmplt_epu8_mask(d0, ten), _mm512_cmplt_epu8_mask(d1, ten), _mm512_cmplt_epu8_mask(d2, ten));
+        // lanes with no set bit in a 64-bit byte mask
+        let clean = |bad: u64| -> u8 {
+            let v = _mm512_movm_epi8(bad);
+            !_mm512_test_epi64_mask(v, v)
+        };
+        let eq = |v: __m512i, t: i64| _mm512_cmpeq_epi8_mask(v, set(t));
+        // separators: '-' at 4 and 7, 'T' at 10, ':' at 13 and 16; F1 'Z' at 19
+        let e0 = eq(v0, tmpl(0x90, b'-'));
+        let e1 = eq(v1, tmpl(0x04, b'T') | tmpl(0x20, b':'));
+        let e2 = eq(v2, tmpl(0x01, b':') | tmpl(0x08, b'Z'));
+        // date-time digits at 0-3, 5-6 | 8-9, 11-12, 14-15 | 17-18
+        let bad_dt = (rep8(0x6F) & !g0) | (rep8(0x90) & !e0) | ((rep8(0xDB) & !g1) | (rep8(0x24) & !e1)) | (rep8(0x06) & !g2) | (rep8(0x01) & !e2);
+        let shape_dt = clean(bad_dt);
+        let n20 = _mm512_cmpeq_epi64_mask(vn, set(20));
+        let is1 = n20 & clean(rep8(0x08) & !e2); // 20 bytes with 'Z' at 19
+        let w10 = _mm512_set1_epi16(0x010A); // byte weights [10, 1]
+        let wd = |p: __m512i, k: u32| _mm512_and_si512(_mm512_srlv_epi64(p, set(16 * k as i64)), set(0xFFFF));
+        let p0 = _mm512_maddubs_epi16(d0, w10); // (0,1) (2,3)
+        let p0s = _mm512_maddubs_epi16(_mm512_srli_epi64(d0, 8), w10); // (5,6) in word 2
+        let p1 = _mm512_maddubs_epi16(d1, w10); // (8,9) word 0, (14,15) word 3
+        let p1s = _mm512_maddubs_epi16(_mm512_srli_epi64(d1, 8), w10); // (11,12) word 1
+        let p2s = _mm512_maddubs_epi16(_mm512_srli_epi64(d2, 8), w10); // (17,18) word 0
+        let y = _mm512_add_epi64(_mm512_mul_epu32(wd(p0, 0), set(100)), wd(p0, 1));
+        let mo = wd(p0s, 2);
+        let dd = wd(p1, 0);
+        let h = wd(p1s, 1);
+        let mi = wd(p1, 3);
+        let sec = wd(p2s, 0);
+        let le = |a: __m512i, k: i64| _mm512_cmple_epu64_mask(a, set(k));
+        // month length with leap years (y in 0..=9999; magic divisions verified over the range)
+        let q100 = _mm512_srli_epi64(_mm512_mul_epu32(y, set(5243)), 19);
+        let q400 = _mm512_srli_epi64(q100, 2);
+        let r100 = _mm512_sub_epi64(y, _mm512_mul_epu32(q100, set(100)));
+        let r400 = _mm512_sub_epi64(y, _mm512_mul_epu32(q400, set(400)));
+        let div4 = _mm512_cmpeq_epi64_mask(_mm512_and_si512(y, set(3)), set(0));
+        let leap = div4 & (_mm512_cmpneq_epi64_mask(r100, set(0)) | _mm512_cmpeq_epi64_mask(r400, set(0)));
+        let t0 = _mm512_setr_epi64(0, 31, 28, 31, 30, 31, 30, 31);
+        let t1 = _mm512_setr_epi64(31, 30, 31, 30, 31, 0, 0, 0);
+        let mlen = _mm512_permutex2var_epi64(t0, mo, t1);
+        let mlen = _mm512_mask_add_epi64(mlen, leap & _mm512_cmpeq_epi64_mask(mo, set(2)), mlen, set(1));
+        // month 1..=12 (the table lookup uses only the index's low 4 bits; mlen = 0 for 0, 13..=15), day 1..=mlen
+        let rng = le(mo, 12) & _mm512_cmpgt_epu64_mask(mlen, set(0)) & le(h, 23) & le(mi, 59) & le(sec, 59) & _mm512_cmpgt_epu64_mask(dd, set(0)) & _mm512_cmple_epu64_mask(dd, mlen);
+        let ok_dt = shape_dt & rng;
+        // days_from_civil(y, mo, 1) + 719468 + 146097 (one era up so everything stays non-negative)
+        let feb = le(mo, 2);
+        let yy = _mm512_add_epi64(y, set(400));
+        let yy = _mm512_mask_sub_epi64(yy, feb, yy, set(1));
+        let era1 = _mm512_srli_epi64(_mm512_mul_epu32(yy, set(5243)), 21);
+        let yoe = _mm512_sub_epi64(yy, _mm512_mul_epu32(era1, set(400)));
+        let mp = _mm512_mask_blend_epi64(feb, _mm512_sub_epi64(mo, set(3)), _mm512_add_epi64(mo, set(9)));
+        let mp = _mm512_and_si512(mp, set(0xF)); // garbage months stay small (their lanes are invalid)
+        let doy = _mm512_srli_epi64(_mm512_mul_epu32(_mm512_add_epi64(_mm512_mul_epu32(mp, set(153)), set(2)), set(13108)), 16);
+        let doe = _mm512_add_epi64(
+            _mm512_sub_epi64(_mm512_add_epi64(_mm512_mul_epu32(yoe, set(365)), _mm512_srli_epi64(yoe, 2)), _mm512_srli_epi64(_mm512_mul_epu32(yoe, set(1311)), 17)),
+            doy,
+        );
+        let dpos = _mm512_add_epi64(_mm512_mul_epu32(era1, set(146_097)), doe); // < 2^23
+        // minutes since the shifted epoch (< 2^32), then ms; the shift comes off as one constant
+        let t = _mm512_add_epi64(_mm512_mul_epu32(_mm512_add_epi64(dpos, _mm512_sub_epi64(dd, set(1))), set(24)), h);
+        let t = _mm512_add_epi64(_mm512_mul_epu32(t, set(60)), mi);
+        const SHIFT_MS: i64 = (719_468 + 146_097) * 86_400_000;
+        let dt = _mm512_sub_epi64(_mm512_add_epi64(_mm512_mullo_epi64(t, set(60_000)), _mm512_mul_epu32(sec, set(1000))), set(SHIFT_MS));
+        let bad = set(BAD);
+        let r1 = _mm512_mask_blend_epi64(ok_dt, bad, dt);
+        if !ALL {
+            _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, r1);
+            return is1;
+        }
+        // F2: sign at 19, ':' at 22, offset digits at 20-21 and 23-24
+        let g3 = _mm512_cmplt_epu8_mask(d3, ten);
+        let plus = clean(rep8(0x08) & !eq(v2, tmpl(0x08, b'+')));
+        let minus = clean(rep8(0x08) & !eq(v2, tmpl(0x08, b'-')));
+        let c22 = clean(rep8(0x40) & !eq(v2, tmpl(0x40, b':')));
+        let n25 = _mm512_cmpeq_epi64_mask(vn, set(25));
+        let is2 = n25 & (plus | minus) & c22;
+        let p2 = _mm512_maddubs_epi16(d2, w10); // (20,21) word 2
+        let oh = wd(p2, 2);
+        let om = _mm512_add_epi64(
+            _mm512_mul_epu32(_mm512_and_si512(_mm512_srli_epi64(d2, 56), set(0xFF)), set(10)),
+            _mm512_and_si512(d3, set(0xFF)),
+        );
+        let off = _mm512_mul_epu32(_mm512_add_epi64(_mm512_mul_epu32(oh, set(60)), om), set(60_000));
+        let f2 = _mm512_mask_blend_epi64(plus, _mm512_add_epi64(dt, off), _mm512_sub_epi64(dt, off));
+        let ok2 = ok_dt & clean((rep8(0xB0) & !g2) | (rep8(0x01) & !g3)) & le(oh, 23) & le(om, 59);
+        // F3: 13 digits = 8 (bytes 0..8) and 5 (bytes 8..13, moved to the top of the qword)
+        let w100 = _mm512_set1_epi32(0x0001_0064); // 16-bit weights [100, 1]
+        let num8 = |d: __m512i| {
+            let u = _mm512_madd_epi16(_mm512_maddubs_epi16(d, w10), w100);
+            _mm512_add_epi64(_mm512_mul_epu32(u, set(10_000)), _mm512_srli_epi64(u, 32))
+        };
+        let f3 = _mm512_add_epi64(_mm512_mul_epu32(num8(d0), set(100_000)), num8(_mm512_slli_epi64(d1, 24)));
+        let ok3 = clean(!g0 | (rep8(0x1F) & !g1));
+        let is3 = _mm512_cmpeq_epi64_mask(vn, set(13));
+        let r2 = _mm512_mask_blend_epi64(ok2, bad, f2);
+        let r3 = _mm512_mask_blend_epi64(ok3, bad, f3);
+        let r = _mm512_mask_blend_epi64(is3, _mm512_mask_blend_epi64(is2, r1, r2), r3);
+        _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, r);
+        is1 | is2 | is3
+    }
+}
+
+/// Load a field's first 32 bytes for ts8 (zero-padded when the chunk ends sooner).
+#[inline(always)]
+fn ts_words(chunk: &[u8], a: usize) -> [u64; 4] {
+    if a + 32 <= chunk.len() {
+        let p = chunk.as_ptr();
+        // SAFETY: a + 32 <= chunk.len()
+        unsafe { [0, 8, 16, 24].map(|o| std::ptr::read_unaligned(p.add(a + o) as *const u64)) }
+    } else {
+        let mut b = [0u8; 32];
+        let e = chunk.len().min(a + 32);
+        b[..e - a].copy_from_slice(&chunk[a..e]);
+        [0, 8, 16, 24].map(|o| u64::from_le_bytes(b[o..o + 8].try_into().unwrap()))
+    }
 }
 
 /// Per-chunk cache for F1 decoding: exact "YYYY-MM-" bytes -> (days at day 1, month length).
@@ -3017,6 +3290,71 @@ fn main() {
                 let _ = mc2.f1(Some(&tails[0][1..21]));
             }
             checked += 1;
+        }
+        // eight-lane SIMD parser: mutated templates (all forms, random lengths, years 0000-9999,
+        // every month/day edge) in random lane order, each followed by a line tail
+        #[cfg(all(target_feature = "avx512bw", target_feature = "avx512dq"))]
+        {
+            let mut lanes_checked = 0u64;
+            for round in 0..1_500_000u64 {
+                let mut fields: Vec<Vec<u8>> = Vec::with_capacity(8);
+                for _ in 0..8 {
+                    let mut t: Vec<u8> = templates[(rnd() % 6) as usize].to_vec();
+                    if rnd() % 3 == 0 && t.len() >= 19 && t[4] == b'-' {
+                        // random full date-time with edges
+                        let y = rnd() % 10000;
+                        let mo = rnd() % 14;
+                        let d = rnd() % 33;
+                        let (h, mi, sc) = (rnd() % 25, rnd() % 61, rnd() % 61);
+                        let dt = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{sc:02}");
+                        t[..19].copy_from_slice(dt.as_bytes());
+                    }
+                    for _ in 0..(rnd() % 3) {
+                        let i = (rnd() as usize) % t.len();
+                        t[i] = b"0123456789-+:TZtz .\xff/"[(rnd() as usize) % 21];
+                    }
+                    if rnd() % 10 == 0 {
+                        t.truncate((rnd() as usize) % t.len() + 1);
+                    }
+                    if rnd() % 25 == 0 {
+                        t.clear();
+                    }
+                    fields.push(t);
+                }
+                let mut w = [[0u64; 8]; 4];
+                let mut n = [0u64; 8];
+                let mut leaked: Vec<&'static [u8]> = Vec::with_capacity(8);
+                for (l, f) in fields.iter().enumerate() {
+                    let mut buf = f.clone();
+                    buf.extend_from_slice(if round % 2 == 0 { b",2026-10-03T23:58:10Z,view,p1," } else { b"\n" });
+                    let pb: &'static [u8] = Box::leak(buf.into_boxed_slice());
+                    let ws4 = ts_words(pb, 0);
+                    for k in 0..4 {
+                        w[k][l] = ws4[k];
+                    }
+                    n[l] = f.len() as u64;
+                    leaked.push(&pb[..f.len()]);
+                }
+                let mut out = [0i64; 8];
+                let dec = ts8::<true>(&w, &n, &mut out);
+                let mut out1 = [0i64; 8];
+                let dec1 = ts8::<false>(&w, &n, &mut out1);
+                for l in 0..8 {
+                    let fb = leaked[l];
+                    let want = parse_ts_ref(if fb.is_empty() { None } else { Some(fb) });
+                    if (dec1 >> l) & 1 == 1 {
+                        assert_eq!(out1[l], want, "ts8 F1-only mismatch on {:?}", String::from_utf8_lossy(fb));
+                    }
+                    if (dec >> l) & 1 == 1 {
+                        assert_eq!(out[l], want, "ts8 mismatch on {:?}", String::from_utf8_lossy(fb));
+                        lanes_checked += 1;
+                    } else {
+                        assert!(!(fb.len() == 13 || (fb.len() == 20 && fb[19] == b'Z')), "ts8 left a standard field undecided: {:?}", String::from_utf8_lossy(fb));
+                    }
+                }
+            }
+            checked += lanes_checked;
+            eprintln!("SELFTEST ok: ts8 decided {lanes_checked} lanes identically");
         }
         eprintln!("SELFTEST ok: {checked} timestamps identical");
         // scanners must agree on every line (all event, click and link chunks, plus synthetic lines)

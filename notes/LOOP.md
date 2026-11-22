@@ -311,3 +311,18 @@ PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried 
 - clicks: 13-digit ts through parse_ts_over (SWAR), uid hash via h12_over when 8 chunk bytes follow: click parse cpu 1.08-1.31 -> 1.02-1.09. kept.
 - v61 = v60 + those three, PGO regenerated. Gate PASS, seeds 241 242 (old gen) + 504 505 (v5 gen) MATCH, v5 dev answer MATCH.
   stimer 12 rounds: v5 n60 +0.5% (5/12), v5 n20 +0.6% (4/12); cpuab 8 rounds n60: cpu 15.19 -> 14.93 core-s (-1.7%), wall -2.0% (4/8). Small, real in CPU, inside wall noise.
+
+## Nov 22 ~04:20 UTC: different designs (user: "try a different design")
+- DIRECT: parser writes keys/payloads straight into shard-grouped arenas (per-thread BLK=2048 blocks per shard,
+  64 MB segments on demand), dedup by arena index, resolve/person partition over block lists: no key/user shuffle.
+  Exact (gate, seeds 243-245 + 506-508, v5 dev). Direct stores: total cpu 15.31 -> 16.84 core-s (parse +2.0);
+  with per-shard WC staging: 15.77 -> 15.90 (parse +1.2, partitions -1.5, resolve/pm +0.4). Tie: the scatter cost is in the
+  staging, not the extra pass. Reverted (scratchpad direct_arena.patch).
+- Shard count: SH_BITS 7 +5.7% (0/8), 9 -0.4% (6/8) at v5 n60: 256 stays.
+- v62 SIMD batched timestamps: lines wait in batches of 8; ts8 (AVX-512 F/BW/DQ, no VBMI) parses 8 ts (F1/F2/13-digit F3, all
+  computed and selected by mask) and 8 ingest_ts (F1-only variant) at once, fields gathered straight from the chunk
+  (copy path within 32 B of a chunk end); other forms -> scalar parse_ts. Magic divisions verified exhaustively.
+  SELFTEST: ts8 decided 8,321,249 fuzz lanes identically (both variants); found+fixed a month-17 alias in the table lookup.
+  Gate PASS, seeds 246-248, 9202, 509-511 MATCH, v5 dev MATCH, full 20M outputs identical to v61 (p20m, n20).
+  PARSESTAGE 1 thread p20m: 64.3 -> 58.6 ns/line (-8.9%, 6/6). stimer 12 rounds: v5 n60 -3.8% (8/12, 6/12 >3%), v5 n20 -0.8% (7/12);
+  cpuab 8 rounds n60: cpu 15.34 -> 15.11 (-1.5%), wall -0.5% (5/8).
