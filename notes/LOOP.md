@@ -326,3 +326,7 @@ PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried 
   Gate PASS, seeds 246-248, 9202, 509-511 MATCH, v5 dev MATCH, full 20M outputs identical to v61 (p20m, n20).
   PARSESTAGE 1 thread p20m: 64.3 -> 58.6 ns/line (-8.9%, 6/6). stimer 12 rounds: v5 n60 -3.8% (8/12, 6/12 >3%), v5 n20 -0.8% (7/12);
   cpuab 8 rounds n60: cpu 15.34 -> 15.11 (-1.5%), wall -0.5% (5/8).
+- v62 clean build: docker --network=none --no-cache of 18f8a5a OK, container output MATCH v5 dev answer.
+- Hash upper bound (h12_over -> trivial values in the batch tail): p20m 59.8 -> 53.0, n20 65.8 -> 55.8 ns/line, but flawed
+  (trivial hashes put every record in one shard). wyhash-style 16 B per multiply + parallel finish multiplies: exact (all
+  20M outputs identical, gate, seeds 249 512 513) but p20m 58.7 -> 60.3, n20 66.2 -> 65.6: no gain (OoO already hides the chain). Reverted.
