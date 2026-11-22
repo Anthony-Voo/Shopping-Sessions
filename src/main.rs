@@ -3905,8 +3905,15 @@ last,b,c,d,e,f,g"#
     // per-shard vectors faulted in 4 KB pages; the lookup tables are reused per thread.
     // resolve writes only each record's person id; the person partition below builds the PR/CR
     // records straight from (user-shard record, pid) in person-shard order (no PR/CR copy)
-    let mut epid_all: Vec<u32> = vec![0; uev_all.len()];
-    let mut cpid_all: Vec<u32> = vec![0; ucl_all.len()];
+    // not zero-filled (a serial 300 MB memset at 60M): resolve writes every element, asserted per shard
+    let mut epid_all: Vec<u32> = Vec::with_capacity(uev_all.len());
+    let mut cpid_all: Vec<u32> = Vec::with_capacity(ucl_all.len());
+    // SAFETY: u32 has no invalid bit patterns; each shard's resolve job assigns every slot of its
+    // slices (its loops cover exactly evs.len() and cls.len() elements) before anything reads them
+    unsafe {
+        epid_all.set_len(uev_all.len());
+        cpid_all.set_len(ucl_all.len());
+    }
     let prs_slices = shard_slices(&mut epid_all, &uev_off);
     let crs_slices = shard_slices(&mut cpid_all, &ucl_off);
     let jobs: Vec<(usize, (&mut [u32], &mut [u32]))> = prs_slices.into_iter().zip(crs_slices).enumerate().collect();
@@ -4369,25 +4376,54 @@ last,b,c,d,e,f,g"#
             }
         }
     }
+    // revenue fits 32 bits in practice: one choice for the whole table (every part file gets the
+    // same column type), INT64 as soon as any row needs it
+    let rev32 = user_parts.par_iter().all(|v| v.iter().all(|r| { r.revenue } >= 0 && { r.revenue } <= i32::MAX as i64));
     groups.into_par_iter().enumerate().for_each(|(gi, parts)| {
         let rows: Vec<&URow> = parts.iter().flat_map(|p| p.iter()).collect();
         let n = rows.len();
         // pages are filled straight from the rows into one reused buffer (no value vectors)
         let uid = |p: &mut Vec<u8>| pq::str_page(p, n, |i| Some(rows[i].name), false);
-        let day = |p: &mut Vec<u8>| pq::fixed_page::<4>(p, n, |i| rows[i].day.to_le_bytes());
-        // counts are at most the number of events (< 2^31): 32-bit columns, 8 bytes less per row
-        let ses = |p: &mut Vec<u8>| pq::fixed_page::<4>(p, n, |i| (rows[i].sessions as i32).to_le_bytes());
-        let evn = |p: &mut Vec<u8>| pq::fixed_page::<4>(p, n, |i| (rows[i].events as i32).to_le_bytes());
-        let rev = |p: &mut Vec<u8>| pq::fixed_page::<8>(p, n, |i| rows[i].revenue.to_le_bytes());
+        // day, sessions and events take few distinct values: dictionary pages (the values of the
+        // group's range, in order) + bit-packed indexes instead of 4 plain bytes per row; a range
+        // over 2^16 falls back to plain INT32
+        let (mut dlo, mut dhi, mut smax, mut emax) = (i32::MAX, i32::MIN, 0u32, 0u32);
+        for r in &rows {
+            dlo = dlo.min(r.day);
+            dhi = dhi.max(r.day);
+            smax = smax.max(r.sessions as u32);
+            emax = emax.max(r.events as u32);
+        }
+        if n == 0 {
+            (dlo, dhi) = (0, 0);
+        }
+        const DMAX: u32 = 1 << 16;
+        let dcount = (dhi as i64 - dlo as i64 + 1).min(u32::MAX as i64) as u32;
+        let day_plain = |p: &mut Vec<u8>| pq::fixed_page::<4>(p, n, |i| rows[i].day.to_le_bytes());
+        let day_dict = |p: &mut Vec<u8>| pq::dict_page(p, n, pq::dict_bits(dcount), |i| (rows[i].day - dlo) as u32);
+        // counts are at most the number of events (< 2^31): 32-bit columns
+        let ses_plain = |p: &mut Vec<u8>| pq::fixed_page::<4>(p, n, |i| (rows[i].sessions as i32).to_le_bytes());
+        let ses_dict = |p: &mut Vec<u8>| pq::dict_page(p, n, pq::dict_bits(smax + 1), |i| rows[i].sessions as u32);
+        let evn_plain = |p: &mut Vec<u8>| pq::fixed_page::<4>(p, n, |i| (rows[i].events as i32).to_le_bytes());
+        let evn_dict = |p: &mut Vec<u8>| pq::dict_page(p, n, pq::dict_bits(emax + 1), |i| rows[i].events as u32);
+        let day: (pq::Kind, &(dyn Fn(&mut Vec<u8>) + Sync)) =
+            if dcount <= DMAX { (pq::Kind::Dict32(true, dlo, dcount), &day_dict) } else { (pq::Kind::Date, &day_plain) };
+        let ses: (pq::Kind, &(dyn Fn(&mut Vec<u8>) + Sync)) =
+            if smax < DMAX { (pq::Kind::Dict32(false, 0, smax + 1), &ses_dict) } else { (pq::Kind::I32, &ses_plain) };
+        let evn: (pq::Kind, &(dyn Fn(&mut Vec<u8>) + Sync)) =
+            if emax < DMAX { (pq::Kind::Dict32(false, 0, emax + 1), &evn_dict) } else { (pq::Kind::I32, &evn_plain) };
+        let rev64 = |p: &mut Vec<u8>| pq::fixed_page::<8>(p, n, |i| rows[i].revenue.to_le_bytes());
+        let rev_32 = |p: &mut Vec<u8>| pq::fixed_page::<4>(p, n, |i| (rows[i].revenue as i32).to_le_bytes());
+        let rev: (pq::Kind, &(dyn Fn(&mut Vec<u8>) + Sync)) = if rev32 { (pq::Kind::I32, &rev_32) } else { (pq::Kind::I64, &rev64) };
         let top = |p: &mut Vec<u8>| pq::str_page(p, n, |i| if rows[i].top == NO_TOP { None } else { Some(cat_name(rows[i].top)) }, true);
         pq::write(
             &ud.join(format!("part-{gi}.parquet")),
             &[
                 ("user_id", pq::Col::Fill(pq::Kind::Str(false), n, &uid)),
-                ("day", pq::Col::Fill(pq::Kind::Date, n, &day)),
-                ("sessions", pq::Col::Fill(pq::Kind::I32, n, &ses)),
-                ("events", pq::Col::Fill(pq::Kind::I32, n, &evn)),
-                ("revenue_cents", pq::Col::Fill(pq::Kind::I64, n, &rev)),
+                ("day", pq::Col::Fill(day.0, n, day.1)),
+                ("sessions", pq::Col::Fill(ses.0, n, ses.1)),
+                ("events", pq::Col::Fill(evn.0, n, evn.1)),
+                ("revenue_cents", pq::Col::Fill(rev.0, n, rev.1)),
                 ("top_category", pq::Col::Fill(pq::Kind::Str(true), n, &top)),
             ],
         )

@@ -1,5 +1,5 @@
-//! Minimal Parquet writer: one row group, one uncompressed PLAIN data page (v1) per
-//! column, flat schema. Supports REQUIRED/OPTIONAL BYTE_ARRAY (UTF8), INT32 (DATE)
+//! Minimal Parquet writer: one row group, one uncompressed data page (v1) per column (PLAIN, or
+//! RLE_DICTIONARY after a dictionary page for small-range INT32 columns), flat schema. Supports REQUIRED/OPTIONAL BYTE_ARRAY (UTF8), INT32 (DATE)
 //! and INT64. Metadata is Thrift compact protocol, hand-encoded.
 
 use std::io::Write;
@@ -23,6 +23,42 @@ pub enum Kind {
     Date,
     I64,
     I32,
+    /// INT32 (a DATE if the flag is set) whose values all lie in base..base + count: written as a
+    /// dictionary page holding exactly those `count` values in order and one RLE_DICTIONARY data
+    /// page of bit-packed indexes (value - base); the closure writes that page with dict_page
+    Dict32(bool /* date */, i32 /* base */, u32 /* count */),
+}
+
+/// Bits per index for a dictionary of `count` values (at least 1).
+pub fn dict_bits(count: u32) -> u32 {
+    (32 - count.saturating_sub(1).leading_zeros()).max(1)
+}
+
+/// Body of an RLE_DICTIONARY data page: the bit width, then one bit-packed run of all n indexes
+/// (get(i) < 2^width; LSB first, padded with zeros to a multiple of 8 values).
+pub fn dict_page(page: &mut Vec<u8>, n: usize, width: u32, get: impl Fn(usize) -> u32) {
+    let groups = n.div_ceil(8);
+    page.reserve(groups * width as usize + 8);
+    page.push(width as u8);
+    let mut h = ((groups as u64) << 1) | 1;
+    while h >= 0x80 {
+        page.push((h as u8) | 0x80);
+        h >>= 7;
+    }
+    page.push(h as u8);
+    let (mut acc, mut nb) = (0u64, 0u32);
+    for i in 0..groups * 8 {
+        let v = if i < n { get(i) as u64 } else { 0 };
+        debug_assert!(v < (1u64 << width));
+        acc |= v << nb;
+        nb += width;
+        while nb >= 8 {
+            page.push(acc as u8);
+            acc >>= 8;
+            nb -= 8;
+        }
+    }
+    debug_assert!(nb == 0);
 }
 
 /// Body of a PLAIN BYTE_ARRAY page: definition levels (optional columns) then the values.
@@ -167,7 +203,8 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
     let mut f = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
     f.write_all(b"PAR1")?;
     let mut off: i64 = 4;
-    let mut metas: Vec<(i64, i64, i32 /*type*/)> = vec![]; // (page offset, chunk size, type)
+    // (chunk offset, chunk size, type, data page offset if a dictionary page comes first)
+    let mut metas: Vec<(i64, i64, i32, Option<i64>)> = vec![];
     let mut page: Vec<u8> = Vec::new();
     for (_, col) in cols {
         page.clear();
@@ -176,7 +213,7 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
             Col::Fill(k, _, f) => {
                 ty = match k {
                     Kind::Str(_) => 6,
-                    Kind::Date | Kind::I32 => 1,
+                    Kind::Date | Kind::I32 | Kind::Dict32(..) => 1,
                     Kind::I64 => 2,
                 };
                 f(&mut page);
@@ -213,21 +250,40 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
                 }
             }
         }
+        // dictionary page first (Dict32 columns): the `count` values base.., PLAIN
+        let mut dict_size = 0i64;
+        let dict = if let Col::Fill(Kind::Dict32(_, base, count), ..) = col { Some((*base, *count)) } else { None };
+        if let Some((base, count)) = dict {
+            let mut d = T::new();
+            d.i32(1, 2); // DICTIONARY_PAGE
+            d.i32(2, count as i32 * 4);
+            d.i32(3, count as i32 * 4);
+            d.begin(7); // DictionaryPageHeader
+            d.i32(1, count as i32);
+            d.i32(2, 0); // PLAIN
+            d.end();
+            d.b.push(0);
+            f.write_all(&d.b)?;
+            for k in 0..count {
+                f.write_all(&(base + k as i32).to_le_bytes())?;
+            }
+            dict_size = d.b.len() as i64 + count as i64 * 4;
+        }
         let mut h = T::new();
         h.i32(1, 0); // DATA_PAGE
         h.i32(2, page.len() as i32);
         h.i32(3, page.len() as i32);
         h.begin(5); // DataPageHeader
         h.i32(1, nrows as i32);
-        h.i32(2, 0); // PLAIN
+        h.i32(2, if dict.is_some() { 8 } else { 0 }); // RLE_DICTIONARY or PLAIN
         h.i32(3, 3); // RLE
         h.i32(4, 3); // RLE
         h.end();
         h.b.push(0);
         f.write_all(&h.b)?;
         f.write_all(&page)?;
-        let size = (h.b.len() + page.len()) as i64;
-        metas.push((off, size, ty));
+        let size = dict_size + (h.b.len() + page.len()) as i64;
+        metas.push((off, size, ty, dict.map(|_| off + dict_size)));
         off += size;
     }
     // FileMetaData
@@ -246,7 +302,7 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
             Col::I64(_) => (2, false),
             Col::I32(_) => (1, false),
             Col::Fill(Kind::Str(o), ..) => (6, *o),
-            Col::Fill(Kind::Date | Kind::I32, ..) => (1, false),
+            Col::Fill(Kind::Date | Kind::I32 | Kind::Dict32(..), ..) => (1, false),
             Col::Fill(Kind::I64, ..) => (2, false),
         };
         m.i32(1, ty);
@@ -260,7 +316,7 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
                 m.end();
                 m.end();
             }
-            Col::Date(_) | Col::Fill(Kind::Date, ..) => {
+            Col::Date(_) | Col::Fill(Kind::Date | Kind::Dict32(true, ..), ..) => {
                 m.i32(6, 6); // converted DATE
                 m.begin(10);
                 m.begin(6); // DATE
@@ -276,14 +332,21 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
     m.elem_begin(); // RowGroup
     m.list(1, cols.len(), 12);
     let total: i64 = metas.iter().map(|x| x.1).sum();
-    for ((name, _), (poff, size, ty)) in cols.iter().zip(&metas) {
+    for ((name, _), (poff, size, ty, data_off)) in cols.iter().zip(&metas) {
         m.elem_begin(); // ColumnChunk
         m.i64(2, *poff);
         m.begin(3); // ColumnMetaData
         m.i32(1, *ty);
-        m.list(2, 2, 5);
-        m.zz(0); // PLAIN
-        m.zz(3); // RLE
+        if data_off.is_some() {
+            m.list(2, 3, 5);
+            m.zz(0); // PLAIN (dictionary page)
+            m.zz(3); // RLE
+            m.zz(8); // RLE_DICTIONARY
+        } else {
+            m.list(2, 2, 5);
+            m.zz(0); // PLAIN
+            m.zz(3); // RLE
+        }
         m.list(3, 1, 8);
         m.varint(name.len() as u64);
         m.b.extend_from_slice(name.as_bytes());
@@ -291,7 +354,10 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
         m.i64(5, nrows as i64);
         m.i64(6, *size);
         m.i64(7, *size);
-        m.i64(9, *poff);
+        m.i64(9, data_off.unwrap_or(*poff)); // data_page_offset
+        if data_off.is_some() {
+            m.i64(11, *poff); // dictionary_page_offset
+        }
         m.end();
         m.end();
     }

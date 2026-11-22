@@ -106,3 +106,15 @@ organizers' stated ~20% machine-to-machine spread; locally v63 is 2% faster at 2
   11.77 -> 11.45 GB, but 60M vs v65: 4/12, dedup 0.245 -> 0.302, parse lines 1.36 -> 1.43 (misaligned 20 B records),
   clean total -1.4%. Dropped (patch: /tmp/claude-0/dkey20_pos.patch on this VM). A 16 B key is not reachable exactly:
   ing is needed for invalid copies (no payload) and eh2 keeps the 96-bit identity.
+
+## Nov 22 ~11:10 UTC: v66 = v65 + smaller Parquet output + no serial zero fill before resolve
+- Per-stage CPU utilisation on v65 (60M, NCPU=8, 4 vCPU): every stage 97-100% except "pid alloc" (two vec![0; n] of
+  300 MB zeroed on the main thread: 0.047 s at 27%) and "written" (0.34 s wall, 0.84 s sys: the page-cache copy of 247 MB).
+- epid_all / cpid_all are allocated uninitialised (resolve writes every slot): regroup 0.556 -> 0.503 s.
+- user_daily was 38.5 B/row, all PLAIN: day, sessions, events now RLE_DICTIONARY (dictionary page = the group's value range in
+  order, one bit-packed run of indexes; plain INT32 if a range exceeds 2^16) and revenue_cents INT32 when every row fits
+  (one choice for the whole table). 26 B/row: 242 -> 162 MB at 60M; written 0.354 -> 0.315 s.
+  Readers checked: pyarrow (file + dataset), polars, duckdb; kit compare MATCH.
+- 60M vs v65, 12 rounds: all runs +6.8% (8/12); clean medians within noise (-1.6%, 3/4 clean pairs).
+- Exact: gate PASS (hash line skipped), SELFTEST, difftests 616 (Apr -> May window) and 641 MATCH, v5 dev MATCH, 20M and 60M
+  outputs MATCH v65 (kit compare; the canonical-hash script now differs only by revenue's int32 type).
