@@ -361,3 +361,5 @@ PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried 
 - Packed exact ID keys (<= 10 chars [0-9A-Za-z_], 6 bits each, fmix64 bijection; long ids keep the hash, h2 low bit set):
   exact (SELFTEST, gate). scalar packer 186 ns/line; SSE+pext with copy 107; AVX-512 masked load + pext 63.5 vs 59.1 (p20m),
   70.5 vs 67.7 (v5 n20): slower, reverted (patch: scratchpad packed_ids.patch).
+- Two-half parse + key partition (lower memory peak; dedup over two slices per shard): exact (gate, seeds 259 520, n20 = v63),
+  cpuab 8 rounds v5 n60: wall +3.8% (3/8), user 13.83 -> 14.48, sys 1.62 -> 1.67 (no zeroing saved). Reverted (scratchpad half_parse.patch).
