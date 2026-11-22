@@ -50,3 +50,7 @@ vs v54 (both rustc 1.90): 20M pooled 36/48 wall, 38/48 cpu faster (sets -0.4% / 
 - v59 vs v58 on the calibrated timer (warm, NCPU8, 60M, 12 rounds): +0.9%, 6/12 -> tie; v59 was -3% at 20M.
 - Clean build: git archive of 5b5058b, docker build --network=none --no-cache OK; container output MATCH dev answer and MATCH native v59 at 20M.
 - main still = v58 b8cf964 (untouched). Submit by the full hash above. Not submitted (submissions are made by the user).
+
+## Board after the scorer fix (scorer version shopping-sessions-5), read Nov 22 02:34 UTC 
+Goonies #5 at 0.9663 s (user report + board). Leader "today is yesterday's tomorrow" 0.7257, #2 Fraun 0.8661, #3 hillclimbers 0.9224, #4 Jitesh Rao 0.9619, #6 electrum 0.9688, #7 BingBU 0.9730.
+Assumed to be the frozen commit 5b5058b (v59). Local warm NCPU8 20M median 1.223 s -> board/local ~0.79 (was ~0.87 before the fix).
