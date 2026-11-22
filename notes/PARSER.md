@@ -75,3 +75,45 @@ kb8 exactness (commit on this branch): SELFTEST on p20m (v6 == v5 on 3930 chunk 
 all older checks), gate PASS with the kit-hash line skipped (the dev answer was re-issued Nov 21 19:55, after
 gate.sha256 was recorded; v59 and kb8 both MATCH it; 36/36 fixtures, edge MATCH, oracle seeds 41-44 MATCH),
 difftest seeds 601 and 602 MATCH (2M), p20m canonical table hashes == v59, NCPU=1 p20m Parquet files cmp-identical to v59.
+| B13 | links thread profiled (LINKSLAP=1, NCPU=1, 60M): scan 0.10, hash 0.05, intern + union-find 0.48-0.51, roots 0.04, person ids 0.04, root names 0.02, lks 0.1 s (~60% of the thread's samples are kernel: fresh-memory faults) | | |
+| B14 | v6kb9 = kb8 + links: union-find in a second pass over the interned id pairs with parent[] prefetched 16 pairs ahead; pairs / id vectors pre-sized | intern 0.33 + union 0.05 (was 0.48-0.51 together); thread 0.73-0.80 vs 0.82-0.88 s. 60M vs kb8, 12 rounds: +0.66% (6/12), clean +2.2% (2 of 3 clean pairs) | small gain, kept in the stack |
+| B15 | single thread (NCPU=1) PARSER=5 vs 6: key partition 2.2-2.4 s removed, but dedup +0.4-0.6 s and user shuffle +2.3 s (all sys: first touch of the 1.85 GB placeholder costs ~1.2 s/GB single-threaded on this VM; v5 paid the same inside the key partition) | | explains the ties: fault cost moves, the copy saving is eaten by dedup reading scattered blocks |
+| B16 | 512-key blocks (12 KB) instead of 128 | single-thread dedup gap 0.4-0.6 -> 0.21-0.27 s; prefetching the next block: no change (reverted) | kept (kb10) |
+| B17 | v6kb10 = kb9 (links) + 512-key blocks, vs v59, 16 rounds | all: -1.54% (7/16); clean: 3.810 vs 3.989 (-4.7%, 1 of 4 clean pairs); parse lap clean 1.512 -> 1.316; peak RSS 12.15 vs 11.94 GB | tie/loss; not committed (patch: /tmp/claude-0/kb10_over_kb8.patch) |
+
+Pooled over the three key-bucket candidates vs v59 (kb7+PGO, kb8, kb10), clean-run total medians: +1.7%, +1.2%, -4.7%.
+Same-binary clean medians move by +-3-5% between sets on this VM, so effects under ~3% cannot be resolved here.
+
+## Hand-over (Nov 22 ~04:30 UTC)
+
+### Parse breakdown at 60M (seconds of the parse lap, clean runs, NCPU=8, this VM)
+| | v59 | kb8 (branch HEAD code) |
+|---|---|---|
+| compute | 0.95 (58.7 ns/line single thread) | 0.79 (48.5-50.2 ns/line, PGO regenerated) |
+| fresh memory (DKey + PEv first touch) | ~0.28 | ~0.28 in parse (same bytes), but v59's key_all faults (1.85 GB) move to the user shuffle |
+| links contention | 0.11 (thread done at ~1.6 s, overlaps parse + partition) | ~0.2 (thread at nice 0 vs workers at nice 10: done at 0.66-0.80 s, all inside parse) |
+| key partition | 0.27-0.29 | 0 |
+| other | ~0.05 | ~0.05 |
+| **parse lap** | **1.51-1.58** | **1.32-1.37** |
+| total | 3.81-4.08 | 3.97-4.03 (tie) |
+Instructions/line, IPC, misses/line: not measurable (no PMU in this VM; see caveats).
+
+### Changes
+| Change | Branch / full hash | Parse lap v59 -> new (clean) | Total 60M median (rounds won) | Peak RSS | Exact | Verdict |
+|---|---|---|---|---|---|---|
+| v6d cross-line AVX-512 ts/ingest decode | parse/xsimd 564b2555e195f485d9c546a07087e055d5ec0d09 | 1.663 -> 1.671 (same binary P5/P6) | +0.79% (7/12) | 11.91 -> 11.92 | yes | tie |
+| kb3 key blocks, no partition | not committed | 1.717 -> 1.552 | clean -3.9% (1/8 clean pairs) | 11.93 -> 10.94 | yes | loss |
+| kb7 + placeholder + PGO | not committed | 1.578 -> 1.355 | all -6.5% (8/16), clean +1.7% (4/6) | 11.93 -> 11.98 | yes | tie |
+| kb8 = kb7 + workers at nice 10 | parse/xsimd 0ff446e39f9278d52d890e78f5740d6bd48e2a0f | 1.576 -> 1.373 | all +1.03% (7/16), clean +1.2% (3/7) | 11.92 -> 11.95 | yes (SELFTEST, gate*, difftests 601/602, 20M == v59, clean offline build) | tie |
+| kb10 = kb8 + links UF prefetch/pre-size + 512-key blocks | not committed | 1.512 -> 1.316 | all -1.54% (7/16), clean -4.7% (1/4) | 11.94 -> 12.15 | SELFTEST only | tie/loss |
+(*) gate with the kit-hash line skipped: the dev answer was re-issued after gate.sha256 was recorded; v59 and kb8 both MATCH it.
+
+### Submit
+**keep 5b5058b022d0905aa151228e6f8b8d7c6f97cbf0.** No parser change met the bar (>= 8/12 rounds and > 2.5% median at 60M).
+kb8 reaches the parse target (lap 1.32-1.37 s < 1.4 s, exact) but its total is within noise of v59 (+1.0-1.2%):
+the parse saving is paid back downstream (user shuffle now first-touches the memory the key partition used to fault,
+dedup reads scattered key blocks). Expected board change if kb8 were submitted anyway: 0 +- 3%.
+
+Docker: no daemon in this VM (/var/run/docker.sock missing). Clean build instead: `git archive HEAD | tar -x -C /tmp/claude-0/clean`,
+then in it `RUSTFLAGS="-C target-cpu=cascadelake -C relocation-model=static -Cprofile-use=/tmp/claude-0/clean/pgo/merged.profdata" cargo +1.90 build --release --locked --offline`:
+dev answer MATCH, p20m canonical hashes == v59, NCPU=1 p20m Parquet files cmp-identical to the native build and to v59.
