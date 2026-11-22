@@ -118,3 +118,22 @@ organizers' stated ~20% machine-to-machine spread; locally v63 is 2% faster at 2
 - 60M vs v65, 12 rounds: all runs +6.8% (8/12); clean medians within noise (-1.6%, 3/4 clean pairs).
 - Exact: gate PASS (hash line skipped), SELFTEST, difftests 616 (Apr -> May window) and 641 MATCH, v5 dev MATCH, 20M and 60M
   outputs MATCH v65 (kit compare; the canonical-hash script now differs only by revenue's int32 type).
+
+## Nov 22 ~11:35 UTC: v67 = v66 + sessionize without sorting events
+- Rule used: with time buckets no wider than the 30-min gap (2^20 ms = 17.5 min of ts - window_start), two events of a person
+  in one bucket are always in the same session, and two buckets with nothing between them are one session exactly when
+  (earliest ts of the later) - (latest ts of the earlier) <= GAP. A session's start, event count, revenue and purchases
+  are minima / sums over its buckets, so no order among events is needed.
+- Per person shard: count events per person (purchases, ~3%, set aside and sorted by (person, ts)), scatter only the 4-byte
+  times by person (was: 2 radix scatters by time + 1 by person of 14-byte records + an insertion fix-up pass), then per person
+  a branch-free min / max / count per bucket in a 4096 x 12 B table (13.8 KB used for a 14-day window, L1) with a two-level
+  bitmap, walked in time order to emit sessions; each session takes its purchases from the sorted list. Click handling,
+  attribution, assists and rows are unchanged. Whales cost the same per event as anyone (no per-person sort).
+- 60M vs v66 (12 rounds): sessionize 0.980 -> 0.674 s (-31%); total all runs +5.9% (7/12), clean medians 4.210 -> 3.833
+  (+9.0%, 5/5 clean pairs). 20M: sessionize ~0.23 -> ~0.19 s.
+- What is left in sessionize (cycle counters, 20M): per-session body (attribution window, campaign accumulators, rows) ~45%,
+  click sort + prep ~22%, event count/scatter/aggregate/walk ~30%. Counts at 20M: 667k persons with events (65% with clicks),
+  3.36M sessions, 2.22M rows, ~11 campaigns in the window per session, 9.2M assisted updates at day changes.
+- Exact: gate PASS (hash line skipped), SELFTEST, difftests 612 (month-crossing) and 651 MATCH, 20M and 60M outputs MATCH v66,
+  and an adversarial set (data/edge-bucket: 211k events on bucket/day/window edges, gaps of GAP-1 / GAP / GAP+1, dense
+  buckets, whales, equal timestamps, links) MATCH the Python oracle at NCPU=8 and NCPU=1.

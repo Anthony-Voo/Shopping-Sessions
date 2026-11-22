@@ -4089,9 +4089,22 @@ last,b,c,d,e,f,g"#
     #[derive(Default)]
     struct Scratch {
         u: [Vec<u32>; 8],
-        eg: Vec<PR>,
+        eg: Vec<PR>,              // the shard's purchases, sorted by (person, ts)
         cg: Vec<CR>,
+        ets: Vec<u32>,            // event times (ts - window_start) grouped by person
+        agg: Vec<[u32; 3]>,       // per time bucket of one person: min ts, max ts, events
+        sess: Vec<(u32, u32, u32)>, // one person's sessions: first ts, last ts, events
     }
+    // Sessions without sorting events. A bucket is 2^SBITS ms of the window (17.5 min <= the
+    // 30 min gap), so two events of one person in the same bucket are always in the same session,
+    // and two buckets with nothing between them belong to one session exactly when the later
+    // one's earliest event is within GAP of the earlier one's latest event (that pair is the
+    // only neighbouring pair of the sorted order that straddles them). A session's start, event
+    // count and purchases are sums/minima over its buckets, so per person only min, max and
+    // count per bucket are needed: no order among the events themselves.
+    const SBITS: u32 = 20;
+    const NBK: usize = 1 << (32 - SBITS); // ts - window_start is a u32
+    const _: () = assert!((1i64 << SBITS) <= GAP);
     // output rows: one growing buffer per thread (large, so huge-page backed) instead of a small
     // vector per shard; the writer groups rows by thread anyway
     let rowsv: Vec<std::sync::Mutex<Vec<URow>>> = (0..nthreads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
@@ -4114,6 +4127,14 @@ last,b,c,d,e,f,g"#
             let (mut eoff, mut pos, mut coff, mut cpos) = (take_u(0), take_u(1), take_u(2), take_u(3));
             let (mut acnt, mut apos, mut enter, mut alist) = (take_u(4), take_u(5), take_u(6), take_u(7));
             let (mut eg, mut cg) = (std::mem::take(&mut scr.eg), std::mem::take(&mut scr.cg));
+            let (mut ets, mut aggv, mut sess) = (std::mem::take(&mut scr.ets), std::mem::take(&mut scr.agg), std::mem::take(&mut scr.sess));
+            if aggv.len() != NBK {
+                aggv = vec![[u32::MAX, 0, 0]; NBK]; // empty bucket: min = MAX, max = 0, count = 0
+            }
+            let agg: &mut [[u32; 3]; NBK] = (&mut aggv[..]).try_into().unwrap();
+            // bucket bitmap of the current person (64 x 64 bits) + one summary bit per word;
+            // all zero between persons
+            let mut bm = [0u64; NBK / 64];
             // group by person with a counting sort over the shard's contiguous id range, then sort
             // each person's (few) events by time; clicks are grouped the same way
             let base = (sh as u32) << PL_BITS;
@@ -4121,24 +4142,33 @@ last,b,c,d,e,f,g"#
             let li = |key: u64| -> usize { ((key >> 32) as u32 - base) as usize };
             eoff.clear();
             eoff.resize(np + 1, 0);
+            // events: count per person and set the (few) purchases aside, then scatter only the
+            // 4-byte times by person (a counting sort; the order inside a person does not matter)
             eg.clear();
-            eg.reserve(evin.len());
-            // SAFETY: every slot in 0..evin.len() is written exactly once below
-            unsafe { eg.set_len(evin.len()) };
-            // whole-shard stable radix sort by ts (3 passes, ends in eg; the person count rides on
-            // its histogram pass), then a stable counting sort by person back into evin: every
-            // person's events come out ordered by time with no per-person sort
-            radix_22(evin, &mut eg, |r: &PR| (r.key as u32) >> 9, |r: &PR| eoff[li(r.key) + 1] += 1);
+            for r in evin.iter() {
+                eoff[li(r.key) + 1] += 1;
+                if r.price > 0 {
+                    eg.push(*r);
+                }
+            }
             for p in 0..np {
                 eoff[p + 1] += eoff[p];
             }
             pos.clear();
             pos.extend_from_slice(&eoff);
+            ets.clear();
+            ets.reserve(evin.len());
+            // SAFETY: every slot in 0..evin.len() is written exactly once below (u32: any bits valid)
+            unsafe { ets.set_len(evin.len()) };
             for r in evin.iter() {
-                let l = li(r.key);
-                eg[pos[l] as usize] = *r;
+                let k = r.key;
+                let l = li(k);
+                ets[pos[l] as usize] = k as u32;
                 pos[l] += 1;
             }
+            // purchases in (person, ts) order: each session takes its own as the persons are walked
+            eg.sort_unstable_by_key(|r| r.key);
+            let mut pi = 0usize;
             coff.clear();
             coff.resize(np + 1, 0);
             let ncl = cls.len();
@@ -4174,8 +4204,45 @@ last,b,c,d,e,f,g"#
                     continue; // no events: this person has no sessions
                 }
                 let (e0, e1) = (eoff[p] as usize, eoff[p + 1] as usize);
-                insertion_fix(&mut eg[e0..e1], |r: &PR| r.key);
-                let evs = &eg[e0..e1];
+                // min / max / count per bucket, branch-free; the bitmap remembers the buckets used
+                let mut sum = 0u64;
+                for &t in &ets[e0..e1] {
+                    let b = (t >> SBITS) as usize;
+                    let a = &mut agg[b];
+                    a[0] = a[0].min(t);
+                    a[1] = a[1].max(t);
+                    a[2] += 1;
+                    bm[b >> 6] |= 1u64 << (b & 63);
+                    sum |= 1u64 << (b >> 6);
+                }
+                // buckets in time order -> sessions (first ts, last ts, events); buckets are reset
+                sess.clear();
+                let (mut s0, mut smx, mut sn) = (0u32, 0u32, 0u32); // open session; sn == 0: none yet
+                while sum != 0 {
+                    let w = sum.trailing_zeros() as usize;
+                    sum &= sum - 1;
+                    let mut m = bm[w];
+                    bm[w] = 0;
+                    while m != 0 {
+                        let b = w * 64 + m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        let [mn, mx, c] = agg[b];
+                        agg[b] = [u32::MAX, 0, 0];
+                        // mn > smx (a later bucket): same session iff the gap is <= GAP
+                        if sn != 0 && (mn - smx) as i64 <= GAP {
+                            smx = mx;
+                            sn += c;
+                        } else {
+                            if sn != 0 {
+                                sess.push((s0, smx, sn));
+                            }
+                            s0 = mn;
+                            smx = mx;
+                            sn = c;
+                        }
+                    }
+                }
+                sess.push((s0, smx, sn));
                 // clicks: by ts ascending; equal ts ordered by click_id DESCENDING so the last
                 // eligible click is the winner (latest ts, then smallest click_id): fix equal-ts runs
                 let (c0, c1) = (coff[p] as usize, coff[p + 1] as usize);
@@ -4197,9 +4264,7 @@ last,b,c,d,e,f,g"#
                 }
                 let pcl = &*pcl;
                 let pid = base + p as u32;
-                let (i, j) = (0usize, evs.len());
                 let name = name_of_pid(pid);
-                let ets = |x: &PR| ws + (x.key & 0xFFFF_FFFF) as i64;
                 let cts = |x: &CR| cbase + (x.key & 0xFFFF_FFFF) as i64;
                 // sliding window [lo, hi) over this person's clicks
                 let (mut lo, mut hi) = (0usize, 0usize);
@@ -4210,12 +4275,10 @@ last,b,c,d,e,f,g"#
                 let mut sc = 0u32; // sessions of this person so far
                 let mut cur_day = i32::MIN;
                 let mut row: Option<URow> = None;
-                let mut k = i;
-                while k < j {
-                    // one session: extend while gap between distinct timestamps <= GAP. Its day
-                    // (from the start) is known first, so purchases go straight into the row's
-                    // category totals in the same pass (no second walk over the events)
-                    let start = ets(&evs[k]);
+                for &(s_rel, mx_rel, n) in sess.iter() {
+                    // one session (events with gaps <= GAP between distinct timestamps): its day
+                    // comes from its start
+                    let start = ws + s_rel as i64;
                     let day = start.div_euclid(DAY) as i32;
                     if day != cur_day {
                         if let Some(r) = row.take() {
@@ -4230,31 +4293,24 @@ last,b,c,d,e,f,g"#
                         cur_day = day;
                         row = Some(URow { name, day, sessions: 0, events: 0, revenue: 0, top: NO_TOP });
                     }
-                    let mut prev = start;
-                    let mut e = k;
+                    // the session's purchases: this person's next ones up to its last timestamp
+                    // (earlier persons' and sessions' purchases are already taken)
                     let (mut rev, mut purch) = (0i64, false);
-                    while e < j {
-                        let x = evs[e];
-                        let t = ets(&x);
-                        if !(t == prev || t - prev <= GAP) {
-                            break;
+                    let last_key = ((pid as u64) << 32) | mx_rel as u64;
+                    while pi < eg.len() && { eg[pi].key } <= last_key {
+                        let x = eg[pi];
+                        purch = true;
+                        rev += x.price as i64;
+                        let xc = if x.cat == u16::MAX { UNKNOWN_CAT } else { x.cat as u32 };
+                        match cats.iter_mut().find(|c| c.0 == xc) {
+                            Some(c) => c.1 += x.price as i64,
+                            None => cats.push((xc, x.price as i64)),
                         }
-                        prev = t;
-                        if x.price > 0 {
-                            purch = true;
-                            rev += x.price as i64;
-                            let xc = if x.cat == u16::MAX { UNKNOWN_CAT } else { x.cat as u32 };
-                            match cats.iter_mut().find(|c| c.0 == xc) {
-                                Some(c) => c.1 += x.price as i64,
-                                None => cats.push((xc, x.price as i64)),
-                            }
-                        }
-                        e += 1;
+                        pi += 1;
                     }
-                    let n = (e - k) as i64;
                     let r = row.as_mut().unwrap();
                     r.sessions += 1;
-                    r.events += n as u32;
+                    r.events += n;
                     r.revenue += rev;
                     // attribution window: start - WEEK <= click.ts <= start
                     while hi < pcl.len() && cts(&pcl[hi]) <= start {
@@ -4286,7 +4342,6 @@ last,b,c,d,e,f,g"#
                     a.purchasing += purch as u32;
                     a.rev += rev;
                     sc += 1;
-                    k = e;
                 }
                 for &c in &alist {
                     camp[cidx(c, cur_day)].assisted += sc - enter[c as usize];
@@ -4301,6 +4356,9 @@ last,b,c,d,e,f,g"#
             scr.u = [eoff, pos, coff, cpos, acnt, apos, enter, alist];
             scr.eg = eg;
             scr.cg = cg;
+            scr.ets = ets;
+            scr.agg = aggv;
+            scr.sess = sess;
             (Vec::new(), Vec::new())
         })
         .collect();
