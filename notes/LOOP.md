@@ -272,3 +272,20 @@ PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried 
   sort+scan ms: gcc 834-919 | clang 893-979 | Rust 859-953 | Go 862-929 -> tie.
   hash ms:      gcc 275-293 | clang 273-286 | Rust 288-376 (first run outlier, then 305/288) | Go 276-299 -> tie.
   Both memory-bound; language irrelevant.
+
+## Nov 21 evening plan (BUDGET.md): scorer timer + big changes
+- TIMER (ws/stimer.py) calibrated on board v26 1.49 / v45 1.22 / v51 1.19 at 20M, 6 interleaved rounds:
+  warm NCPU4 +25.0% / -7.6%; warm NCPU8 +25.6% / -11.1%; cold NCPU4 +33.8% / -7.1%; cold NCPU8 +53.4% / -1.4% (board +22.1% / -2.5%).
+  Cold cache overstates disk-heavy versions: the scorer reads from page cache. Judge = warm NCPU8 at 60M (board ~0.87 x local warm); guard = cold NCPU8 not worse.
+- Parser branch-order upper bound: p20m lines pre-sorted by shape (quotes, ts form, type) -> parse lap 0.443 -> 0.431 (-3% of parse), output MATCH. Not a lever.
+- Links thread: 0.78 s alone (NCPU=1), looks 1.6-1.9 s at NCPU8 only from sharing cores; ~5% of CPU, off the critical path. Not a lever.
+- BIG2 sessionize by person counting + per-person sort (insertion <=32, pdq <=4096, radix above) instead of shard radix_22 + person scatter:
+  exact (gate PASS) but sessionize lap 0.707-0.787 -> 0.807-1.135 at 60M (6 pairs, all worse). Random small sorts are branchy; reverted.
+- BIG1 parse into per-thread scratch + per-chunk WC grouping by shard (keys by event shard, payloads by user shard), dedup/resolve/person-partition over (chunk, shard) slices: removes the key partition and the user shuffle. Exact (gate PASS; patch in scratchpad g2_parse_grouped.patch).
+  Per-stage CPU at 60M (4 interleaved runs, NCPU8): base parse 6.55 + key part 1.00 + dedup 0.97 + u+clicks 1.88 + resolve/pm 1.76 = 12.16 core-s;
+  g2 parse+group 8.55 + dedup 1.34 + u+clicks 1.28 + resolve/pm 2.05 = 13.22. Total 15.67 -> 16.69 core-s; THP faults 3035 -> 2124 (sys -0.5) but user +1.5.
+  Grouping both streams per chunk costs 2.0 core-s vs 1.0 + ~0.6 for the two global partitions; 155 small slices per shard slow dedup/resolve. Wall: stimer warm 12 rounds +4.5% (3/12 faster). Rejected.
+- New tool: lap lines can carry process CPU (scratchpad cpulap.py patch) + ws/cpulaps.py for per-stage CPU medians.
+- Sessionize split (rdtsc, 60M): event radix+person scatter 39%, click sort 10%, per-person scan 50%; ~5 ns per record per scatter pass: at the scatter floor.
+- Parser stages (PARSESTAGE, 1 thread, 20M): structure 12.4 ns/line, +field bounds/quotes 12.3, +values (ts/ing/type/price/product) 26.4, +hash+write 10.7 = 61.8.
+- C3 campaign lookup through the 96-bit ProdTab table instead of the byte-keyed FxHashMap: exact (gate PASS), u+clicks CPU 1.88 -> 1.88 core-s: no effect, reverted.
