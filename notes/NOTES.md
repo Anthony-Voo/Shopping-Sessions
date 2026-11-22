@@ -43,3 +43,10 @@ Branch exp-sh10, SHA 7d7abd0 = v54 with 1024 shards. Same output as v54. This VM
 
 ## Nov 21 ~22:20 UTC: main fast-forwarded to b8cf964 (v58 = v57 + PGO)
 vs v54 (both rustc 1.90): 20M pooled 36/48 wall, 38/48 cpu faster (sets -0.4% / -4.9%); 60M -2% wall, -3% cpu; output identical. Docker image (rust:1.90-slim + pgo/merged.profdata) builds and matches the dev answer. Not yet submitted.
+
+## Nov 22 ~00:20 UTC: FREEZE = 5b5058b022d0905aa151228e6f8b8d7c6f97cbf0 (dev; code = v59 b05f61a)
+- No big change won (BUDGET.md / LOOP.md): parse-grouped fusion +1.0 core-s, person-sort sessionize slower, campaign table no effect; parser branch-order upper bound only -3% of parse.
+- Refreshed PGO profile tested and NOT adopted (60M +2.0%, 3/12; 20M +3.0%, 6/12): the committed v59 profile stays.
+- v59 vs v58 on the calibrated timer (warm, NCPU8, 60M, 12 rounds): +0.9%, 6/12 -> tie; v59 was -3% at 20M.
+- Clean build: git archive of 5b5058b, docker build --network=none --no-cache OK; container output MATCH dev answer and MATCH native v59 at 20M.
+- main still = v58 b8cf964 (untouched). Submit by the full hash above. Not submitted (submissions are made by the user).
