@@ -66,3 +66,5 @@ Assumed to be the frozen commit 5b5058b (v59). Local warm NCPU8 20M median 1.223
 Assumed to be v63 (73501a31afb2b7131a3311387f7df5131e32cbbb), the last commit handed over; v59 scored 0.9663 s.
 v63 local warm NCPU8 on v5 20M: median 1.276 s (v59 ~1.30) -> board/local ~0.78. +2.5% vs v59 on one board run: inside the
 organizers' stated ~20% machine-to-machine spread; locally v63 is 2% faster at 20M and ~5-8% at 60M.
+- Nov 22: v63 resubmitted: board 0.9795 s (user report). v63 board runs so far: 0.99, 0.9795; v59: 0.9663 (one run, likely a fast machine).
+  Local head-to-head v59 vs v63 (12 interleaved runs, warm, NCPU8): v5 20M 1.249 -> 1.203 (-3.8%, 9/12); v5 60M 3.894 -> 3.720 (-4.5%, 12/12).
