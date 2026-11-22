@@ -6,6 +6,7 @@
 //! sessionizing) and needs no locks. Verified against oracle/reference.py.
 
 mod pq;
+mod probe;
 mod recycle;
 
 #[global_allocator]
@@ -3037,6 +3038,12 @@ fn main() {
         .build_global()
         .ok();
     let lap = |what: &str| eprintln!("{:>8.3}s {what}", t0.elapsed().as_secs_f64());
+    // scoring-environment probe (only when SESSIONS_PROBE is set; see probe.rs)
+    let probing = std::env::var_os("SESSIONS_PROBE").is_some();
+    if probing {
+        probe::before(&data);
+        lap("probe section done");
+    }
 
     // manifest (tiny JSON): pull the two ISO strings out
     let man = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
@@ -4517,6 +4524,11 @@ last,b,c,d,e,f,g"#
     )
     .expect("write campaign_daily");
     lap("written");
+    if probing {
+        probe::after();
+        eprintln!("PROBE exiting with status 3 on purpose: this is a diagnostic build, not an entry");
+        std::process::exit(3);
+    }
     // skip freeing gigabytes of memory on the way out
     std::process::exit(0);
 }
