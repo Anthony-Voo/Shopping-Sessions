@@ -89,7 +89,7 @@ Other facts from BUDGET.md:
 | Campaign lookup by array / hash / ProdTab (G10, v44y, C3) | not kept | G10 8/16; C3 1.88 → 1.88 core-s | both | 🟡 | lookup is not the cost |
 | Click parse joined with key partition | G22, not kept | 1.370 → 1.466 (5/16) | 20M | ❌ | loses freed-block reuse |
 | Click chunk 7 MB | R15 | crashes on 20M (1.75 MB: 5/12) | 20M | ⚠️ | click refs need chunks < 4 MB |
-| Skip the click radix for persons with 0/1 clicks | — | n/m | — | ⏳ | listed after v52, never run |
+| Sort clicks per person instead of the whole-shard click radix (insertion ≤ 32, stable sort above) | `8a5a4ab63d6065a21ce3740b8de77055ee774670` (easy/click-person-sort, off v60) | vs v60: total 4.154 → 4.338 (+4.45%, 4/12), sess lap 0.656 → 0.690; same binary old/new path: sess lap 0.661 → 0.703 (+6.4%, 2/12), total -1.5% (8/12, noise); RSS 11.32 → 11.32 GB | 60M | ❌ | exact (gate, seeds 701/702, 20M NCPU=1 byte-identical) but per-person sorts on unsorted clicks cost more than 2 cache-resident radix passes |
 
 ### links
 | Idea | Version / full hash | Measured result | Size | Status | Why |
@@ -196,6 +196,5 @@ Other facts from BUDGET.md:
 2. **Cheaper event-id hash / batched record stores (G3).** **~0.1 s** (LOOP.md expects -5% of parse; parse is 1.96 s).
    - Upper bound ~0.11 s: the hash is 6.9 of 58.7 ns/line, i.e. 12% of the 0.95 s parse compute.
    - Risk: it is a parser micro-change, the kind that keeps tying.
-3. **Skip the click radix for persons with 0/1 clicks.** **≤ 0.08 s**: click sort is 10% of sessionize (0.81 s) at 60M.
-   - Never run.
-   - Sessionize is the second-largest stage.
+3. ~~Skip the click radix for persons with 0/1 clicks~~: tried Nov 22 ~05:00 UTC (`8a5a4ab`), exact but sessionize
+   +6.4% at 60M: ❌. Next easy candidate: price + category in one u32 (P2, ~0.06 s, M effort, medium risk).
