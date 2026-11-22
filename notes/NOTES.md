@@ -160,3 +160,21 @@ organizers' stated ~20% machine-to-machine spread; locally v63 is 2% faster at 2
   v63 1.223 -> v68 1.082 s (+11.5%, 11/12). 60M clean medians in the last set: v68 3.70 s (v63 was ~4.25, v66 ~4.2).
 - The kit's checker (scripts/run_fixtures.py load_actual) reads each part with polars, casts integers to Int128 and accepts
   String / Categorical / Enum for strings, so dictionary pages and INT32 revenue go through the same loader the gate uses.
+
+## Nov 22 ~12:25 UTC: why the board does not follow local timing; scorer probe
+- Board: v59 0.9663, v63 0.9795 / 0.99, v64 0.9656, v65 0.9663, v68 no better (user report). Local warm 20M over the same
+  versions: ~1.25 -> 1.08 s (-14%). The board is not measuring what the local warm timer measures.
+- Track page (scorer shopping-sessions-5): "The clock runs from container start to container exit, including starting your
+  engine and reading CSVs"; fresh container per run; 8 pinned vCPUs (hyperthreads), 24 GB, uid 1000, read-only root,
+  /tmp 64 MB; practice timed 3x when under 20 s (median); practice times vary up to ~20% across scoring machines.
+- Cold-input experiment here (input evicted with posix_fadvise(DONTNEED) before each run, ws/evict.py; this disk reads
+  1.9 GB in ~1.07 s cold): the parse phase becomes disk-bound at 0.72-0.85 s for every version (warm: 0.42-0.55), so
+  parser-side gains (v64 links priority, v65 hash) vanish and totals converge: v59 1.78-1.89, v63 1.60-1.74, v65 1.68-1.78,
+  v68 1.39-1.71 s. That is the board's pattern. Whether the scorer's /data is cold, what its disk does and whether huge
+  pages work there cannot be seen from here.
+- Docker here: ~0.29 s between container creation (/.dockerenv ctime) and main() of our process: fixed, inside the clock.
+- Probe commit 68fb7af (src/probe.rs, SESSIONS_PROBE=1 in the Dockerfile): normal pipeline plus a report of CPU, cgroup
+  limits, THP settings, mounts/devices, page-cache state of /data (preadv2 RWF_NOWAIT sampling; mincore reads 100% for files
+  we cannot write), read() / mmap speeds with disk-byte and major-fault deltas, first-touch cost of 256 MB with and without
+  MADV_HUGEPAGE, thread scaling and memory bandwidth; exits 3 on purpose so the public dev-set check returns the log.
+  Reverted right after (03e6a9d): dev HEAD is v68 code. Entry stays 4969470 until the probe's answer says what to fix.
