@@ -6,7 +6,6 @@
 //! sessionizing) and needs no locks. Verified against oracle/reference.py.
 
 mod pq;
-mod probe;
 mod recycle;
 
 #[global_allocator]
@@ -3037,10 +3036,6 @@ fn main() {
         })
         .build_global()
         .ok();
-    // scoring-environment probe (only when SESSIONS_PROBE is set; see probe.rs): never returns
-    if std::env::var_os("SESSIONS_PROBE").is_some() {
-        probe::run_probe(&data, &out);
-    }
     let lap = |what: &str| eprintln!("{:>8.3}s {what}", t0.elapsed().as_secs_f64());
 
     // manifest (tiny JSON): pull the two ISO strings out
