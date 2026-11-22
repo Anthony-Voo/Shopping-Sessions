@@ -1237,12 +1237,13 @@ fn parse_event_chunk6(
     ws: i64,
     we: i64,
     products: &FxHashMap<B, u32>,
-) -> (Vec<PEv>, Vec<DKey>, Vec<u32>, Vec<u32>) {
+    region: usize,
+) -> (Vec<PEv>, KeyBuckets, Vec<u32>, Vec<u32>) {
     let n = chunk.len();
     assert!(n < (1 << 31), "chunk too large for the structural index");
     let cap = n / 64 + 16;
     let mut pay: Vec<PEv> = Vec::with_capacity(cap);
-    let mut keys: Vec<DKey> = Vec::with_capacity(cap);
+    let mut keys = KbWriter::new(cap, region);
     let mut kcount = vec![0u32; NSH];
     let mut ucount = vec![0u32; NSH]; // valid payloads per user shard
     let mut cm = [0usize; 8];
@@ -1443,13 +1444,189 @@ fn parse_event_chunk6(
                 });
             }
             let (eh, eh2) = h12_over(eid);
-            kcount[shard_h(eh)] += 1;
+            let ksh = shard_h(eh);
+            kcount[ksh] += 1;
             // ingest_ts is always F1 (whole seconds); +-68 years around the window fits in i32
             let ing_s = (ing.div_euclid(1000) - ws.div_euclid(1000)).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-            keys.push(DKey { eh, eh2: eh2 as u32, ing: ing_s, loc: (ush << 48) | ((ci as u64) << 32) | idx });
+            keys.push(ksh, DKey { eh, eh2: eh2 as u32, ing: ing_s, loc: (ush << 48) | ((ci as u64) << 32) | idx });
         }
     }
-    (pay, keys, kcount, ucount)
+    let kb = keys.finish(&kcount);
+    (pay, kb, kcount, ucount)
+}
+
+// ------------------------------------------------------------------ key buckets (parser v6)
+// v6 writes each DKey straight into a 128-key block of its event shard, inside a per-chunk
+// arena, so no separate key partition pass is needed: dedup copies one shard's blocks (chunk
+// order, then line order: the same order the partition produced) into a reused scratch buffer.
+const KB_BLK: usize = 128;
+
+struct KeyBuckets {
+    arenas: Vec<*const DKey>,                  // arena bases (the first may live in a caller's region)
+    _own: Vec<Vec<std::mem::MaybeUninit<DKey>>>, // arenas this chunk allocated itself
+    blocks: Vec<Vec<u32>>, // per shard: block ids (arena << 24 | block index in the arena), in fill order
+    count: Vec<u32>,       // keys per shard
+}
+
+// SAFETY: plain data; the raw block contents are only read after the writer finished
+unsafe impl Send for KeyBuckets {}
+unsafe impl Sync for KeyBuckets {}
+
+impl KeyBuckets {
+    /// Append shard `sh`'s keys, in order, to `out`.
+    #[inline]
+    fn extend_shard(&self, sh: usize, out: &mut Vec<DKey>) {
+        let mut rem = self.count[sh] as usize;
+        out.reserve(rem);
+        for &id in &self.blocks[sh] {
+            let take = rem.min(KB_BLK);
+            let a = self.arenas[(id >> 24) as usize];
+            let b = (id & 0xFF_FFFF) as usize * KB_BLK;
+            // SAFETY: the first `take` slots of this block were written (blocks of a shard fill
+            // in order; only the last one is partial); out has room for them (reserved)
+            unsafe {
+                std::ptr::copy_nonoverlapping(a.add(b), out.as_mut_ptr().add(out.len()), take);
+                out.set_len(out.len() + take);
+            }
+            rem -= take;
+        }
+        debug_assert_eq!(rem, 0);
+    }
+}
+
+struct KbWriter {
+    head: Vec<*mut DKey>,
+    left: Vec<u32>,
+    wc: Vec<DKey>,     // per shard: KB_WC staged keys (write-combining, L2-resident)
+    fill: Vec<u8>,
+    arenas: Vec<*mut DKey>,
+    own: Vec<Vec<std::mem::MaybeUninit<DKey>>>,
+    blocks: Vec<Vec<u32>>,
+    cap_blocks: usize,
+    used: usize, // blocks used in the newest arena
+    nt: bool,    // newest arena is 64-byte aligned: flush with streaming stores
+}
+
+const KB_WC: usize = 8; // 8 keys = 192 B = three 64-byte lines
+
+/// Arena size (in blocks) for a chunk whose key-capacity estimate is cap_keys.
+fn kb_cap_blocks(cap_keys: usize) -> usize {
+    cap_keys / KB_BLK + NSH + 1
+}
+
+impl KbWriter {
+    /// region: a caller-owned area of kb_cap_blocks(cap_keys) blocks for the first arena (0 = allocate)
+    fn new(cap_keys: usize, region: usize) -> Self {
+        let cap_blocks = kb_cap_blocks(cap_keys);
+        assert!(cap_blocks < (1 << 24), "key arena too large");
+        let mut own = Vec::new();
+        let base: *mut DKey = if region != 0 {
+            region as *mut DKey
+        } else {
+            let mut ar: Vec<std::mem::MaybeUninit<DKey>> = Vec::with_capacity(cap_blocks * KB_BLK);
+            let p = ar.as_mut_ptr() as *mut DKey;
+            own.push(ar);
+            p
+        };
+        KbWriter {
+            head: vec![std::ptr::null_mut(); NSH],
+            left: vec![0; NSH],
+            wc: vec![DKey { eh: 0, eh2: 0, ing: 0, loc: 0 }; NSH * KB_WC],
+            fill: vec![0; NSH],
+            arenas: vec![base],
+            own,
+            blocks: (0..NSH).map(|_| Vec::with_capacity(cap_keys / KB_BLK / NSH + 4)).collect(),
+            cap_blocks,
+            used: 0,
+            nt: base as usize % 64 == 0,
+        }
+    }
+
+    #[inline(never)]
+    fn new_block(&mut self, sh: usize) {
+        if self.used == self.cap_blocks {
+            assert!(self.arenas.len() < 255, "too many key arenas");
+            let mut ar: Vec<std::mem::MaybeUninit<DKey>> = Vec::with_capacity(self.cap_blocks * KB_BLK);
+            let p = ar.as_mut_ptr() as *mut DKey;
+            self.own.push(ar);
+            self.nt = p as usize % 64 == 0;
+            self.arenas.push(p);
+            self.used = 0;
+        }
+        let ai = self.arenas.len() - 1;
+        self.blocks[sh].push(((ai as u32) << 24) | self.used as u32);
+        // SAFETY: block `used` lies inside the arena (used < cap_blocks)
+        self.head[sh] = unsafe { self.arenas[ai].add(self.used * KB_BLK) };
+        self.left[sh] = KB_BLK as u32;
+        self.used += 1;
+    }
+
+    /// Move shard sh's full staging buffer (KB_WC keys) into its block.
+    #[inline(always)]
+    fn flush(&mut self, sh: usize) {
+        if self.left[sh] == 0 {
+            self.new_block(sh);
+        }
+        let src = self.wc[sh * KB_WC..].as_ptr();
+        let dst = self.head[sh];
+        // SAFETY: the block has >= KB_WC free slots (blocks hold a multiple of KB_WC keys)
+        unsafe {
+            #[cfg(target_feature = "avx512f")]
+            {
+                use std::arch::x86_64::*;
+                let (s, d) = (src as *const u8, dst as *mut u8);
+                let v0 = _mm512_loadu_si512(s as *const _);
+                let v1 = _mm512_loadu_si512(s.add(64) as *const _);
+                let v2 = _mm512_loadu_si512(s.add(128) as *const _);
+                if self.nt {
+                    // the block offset is a multiple of 192 B from a 64-byte aligned arena
+                    _mm512_stream_si512(d as *mut _, v0);
+                    _mm512_stream_si512(d.add(64) as *mut _, v1);
+                    _mm512_stream_si512(d.add(128) as *mut _, v2);
+                } else {
+                    _mm512_storeu_si512(d as *mut _, v0);
+                    _mm512_storeu_si512(d.add(64) as *mut _, v1);
+                    _mm512_storeu_si512(d.add(128) as *mut _, v2);
+                }
+            }
+            #[cfg(not(target_feature = "avx512f"))]
+            std::ptr::copy_nonoverlapping(src, dst, KB_WC);
+            self.head[sh] = dst.add(KB_WC);
+        }
+        self.left[sh] -= KB_WC as u32;
+    }
+
+    #[inline(always)]
+    fn push(&mut self, sh: usize, k: DKey) {
+        let f = self.fill[sh] as usize;
+        self.wc[sh * KB_WC + f] = k;
+        if f + 1 == KB_WC {
+            self.flush(sh);
+            self.fill[sh] = 0;
+        } else {
+            self.fill[sh] = (f + 1) as u8;
+        }
+    }
+
+    fn finish(mut self, count: &[u32]) -> KeyBuckets {
+        for sh in 0..NSH {
+            let f = self.fill[sh] as usize;
+            if f > 0 {
+                if self.left[sh] == 0 {
+                    self.new_block(sh);
+                }
+                // SAFETY: the block has room for a partial staging buffer
+                unsafe { std::ptr::copy_nonoverlapping(self.wc[sh * KB_WC..].as_ptr(), self.head[sh], f) };
+                self.left[sh] -= f as u32;
+            }
+        }
+        #[cfg(target_feature = "sse2")]
+        // SAFETY: orders the streaming stores before the buckets are handed to other threads
+        unsafe {
+            std::arch::x86_64::_mm_sfence()
+        };
+        KeyBuckets { arenas: self.arenas.iter().map(|&p| p as *const DKey).collect(), _own: self.own, blocks: self.blocks, count: count.to_vec() }
+    }
 }
 
 
@@ -2998,8 +3175,36 @@ fn main() {
     };
     let ncpu: usize = env("NCPU", "0").parse().unwrap_or(0);
     let ncpu = if ncpu == 0 { std::thread::available_parallelism().map_or(8, |n| n.get()) } else { ncpu };
-    rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().ok();
-    let lap = |what: &str| eprintln!("{:>8.3}s {what}", t0.elapsed().as_secs_f64());
+    // rayon workers run at a lower priority (nice WORKER_NICE, default 10) than the links thread, so
+    // the links thread finishes while events are parsed instead of time-slicing with dedup
+    // (raising a thread's own nice value needs no privilege)
+    let wnice: i32 = env("WORKER_NICE", "10").parse().unwrap_or(10);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(ncpu)
+        .start_handler(move |_| {
+            if wnice != 0 {
+                unsafe extern "C" {
+                    fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+                    fn gettid() -> i32;
+                }
+                // SAFETY: plain libc calls on this thread's own id
+                unsafe { setpriority(0, gettid() as u32, wnice) };
+            }
+        })
+        .build_global()
+        .ok();
+    let lapcpu = std::env::var_os("LAPCPU").is_some();
+    let lap = |what: &str| {
+        if lapcpu {
+            // process user / sys CPU so far (diagnostics only)
+            let t = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+            let f: Vec<&str> = t.rsplit(')').next().unwrap_or("").split_whitespace().collect();
+            let (u, y) = (f.get(11).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0), f.get(12).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0));
+            eprintln!("{:>8.3}s {what}  [cpu u {:.2} s {:.2}]", t0.elapsed().as_secs_f64(), u / 100.0, y / 100.0);
+        } else {
+            eprintln!("{:>8.3}s {what}", t0.elapsed().as_secs_f64());
+        }
+    };
 
     // manifest (tiny JSON): pull the two ISO strings out
     let man = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
@@ -3456,7 +3661,21 @@ last,b,c,d,e,f,g"#
         // v6 (cross-line timestamp decode) must give v5's records exactly
         let same6 = |c: &'static [u8], ci: usize, prods: &FxHashMap<B, u32>| -> bool {
             let (a5, b5, k5, u5) = parse_event_chunk5(c, ci, ws, we, prods);
-            let (a6, b6, k6, u6) = parse_event_chunk6(c, ci, ws, we, prods);
+            // odd chunk indexes: keys into a caller-owned region (as in the pipeline); even: own arenas
+            let mut reg: Vec<std::mem::MaybeUninit<DKey>> = Vec::with_capacity(if ci % 2 == 1 { kb_cap_blocks(c.len() / 64 + 16) * KB_BLK } else { 0 });
+            let region = if ci % 2 == 1 { reg.as_mut_ptr() as usize } else { 0 };
+            let (a6, b6, k6, u6) = parse_event_chunk6(c, ci, ws, we, prods, region);
+            // v6 keys, shard by shard, must be v5's keys of that shard in the same order
+            let mut b6f: Vec<DKey> = Vec::new();
+            let mut b5f: Vec<DKey> = Vec::new();
+            for sh in 0..NSH {
+                b6.extend_shard(sh, &mut b6f);
+                b5f.extend(b5.iter().filter(|k| shard_h(k.eh) == sh).copied());
+            }
+            drop(b6);
+            drop(reg);
+            let b6 = b6f;
+            let b5 = b5f;
             a5.len() == a6.len() && b5.len() == b6.len() && k5 == k6 && u5 == u6
                 && a5.iter().zip(&a6).all(|(x, y)| x.pk == y.pk && x.uoff == y.uoff && x.pk2 == y.pk2 && x.ts == y.ts && x.price == y.price && x.cat == y.cat)
                 && b5.iter().zip(&b6).all(|(x, y)| x.eh == y.eh && x.eh2 == y.eh2 && x.ing == y.ing && x.loc == y.loc)
@@ -3571,7 +3790,10 @@ last,b,c,d,e,f,g"#
                     1 => parse5_stage::<1>(c, ci, ws, we, &products),
                     2 => parse5_stage::<2>(c, ci, ws, we, &products),
                     3 => parse5_stage::<3>(c, ci, ws, we, &products),
-                    6 => parse_event_chunk6(c, ci, ws, we, &products),
+                    6 => {
+                        std::hint::black_box(&parse_event_chunk6(c, ci, ws, we, &products, 0));
+                        continue;
+                    }
                     _ => parse_event_chunk5(c, ci, ws, we, &products),
                 };
                 std::hint::black_box(&o);
@@ -3666,26 +3888,50 @@ last,b,c,d,e,f,g"#
     }
     // PARSER=5 selects the v5 parser (fallback); default v6
     let parser6 = std::env::var("PARSER").map_or(true, |v| v != "5");
-    let per_chunk: Vec<(Vec<UEv>, Vec<DKey>, Vec<u32>, Vec<u32>)> = ev_chunks
+    let per_chunk: Vec<(Vec<UEv>, Result<Vec<DKey>, KeyBuckets>, Vec<u32>, Vec<u32>)> = ev_chunks
         .par_iter()
         .enumerate()
-        .map(|(ci, &c)| if parser6 { parse_event_chunk6(c, ci, ws, we, &products) } else { parse_event_chunk5(c, ci, ws, we, &products) })
+        .map(|(ci, &c)| {
+            if parser6 {
+                let (a, b, k, u) = parse_event_chunk6(c, ci, ws, we, &products, 0);
+                (a, Err(b), k, u)
+            } else {
+                let (a, b, k, u) = parse_event_chunk5(c, ci, ws, we, &products);
+                (a, Ok(b), k, u)
+            }
+        })
         .collect();
     lap("  parse lines");
     let mut pays: Vec<Vec<UEv>> = Vec::with_capacity(per_chunk.len());
     let mut keys: Vec<Vec<DKey>> = Vec::with_capacity(per_chunk.len());
+    let mut kbs: Vec<KeyBuckets> = Vec::with_capacity(per_chunk.len());
     let mut kcounts: Vec<Vec<u32>> = Vec::with_capacity(per_chunk.len());
     let mut ucounts: Vec<Vec<u32>> = Vec::with_capacity(per_chunk.len());
     for (a, b, c, d) in per_chunk {
         pays.push(a);
-        keys.push(b);
+        match b {
+            Ok(v) => keys.push(v),
+            Err(kb) => kbs.push(kb),
+        }
         kcounts.push(c);
         ucounts.push(d);
     }
-    let key_refs: Vec<&[DKey]> = keys.iter().map(|v| v.as_slice()).collect();
-    let pay_bytes: usize = pays.iter().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<UEv>();
-    let (key_all, key_off) = partition_sized(&key_refs, Some(kcounts), pay_bytes, |_, _| true, |k: &DKey| shard_h(k.eh));
-    drop(key_refs);
+    let bucketed = !kbs.is_empty();
+    // v6: an untouched block the size of the user-shuffle output, freed just before the shuffle so
+    // the shuffle reuses it (as v5's partitioned key array): the per-chunk key arenas then stay
+    // free for the later stages' per-chunk buffers, the way v5's per-chunk key vectors do
+    let hold: Vec<u8> = if bucketed {
+        Vec::with_capacity(pays.iter().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<UEv>())
+    } else {
+        Vec::new()
+    };
+    let (key_all, key_off) = if bucketed {
+        (Vec::new(), Vec::new())
+    } else {
+        let key_refs: Vec<&[DKey]> = keys.iter().map(|v| v.as_slice()).collect();
+        let pay_bytes: usize = pays.iter().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<UEv>();
+        partition_sized(&key_refs, Some(kcounts), pay_bytes, |_, _| true, |k: &DKey| shard_h(k.eh))
+    };
     drop(keys);
     lap("events parsed");
 
@@ -3708,9 +3954,70 @@ last,b,c,d,e,f,g"#
     // per-thread open-addressing table (reused across shards): one u64 per slot holding the
     // hash's high 40 bits and (index + 1) in the low 24 bits; capacity 2x keys (<= 50% load)
     (0..NSH).into_par_iter().for_each_init(
-        || Vec::<u64>::new(),
-        |tab, shi| {
-            let ks = &key_all[key_off[shi]..key_off[shi + 1]];
+        || (Vec::<u64>::new(), Vec::<(*const DKey, usize)>::new()),
+        |(tab, scratch), shi| {
+            if bucketed {
+                // the same dedup over the shard's key blocks in place (chunk order, then fill
+                // order = the partition's order); a key's index is block number * 128 + offset
+                let bp: &mut Vec<(*const DKey, usize)> = scratch;
+                bp.clear();
+                let mut nk = 0usize;
+                for kb in &kbs {
+                    let mut rem = kb.count[shi] as usize;
+                    nk += rem;
+                    for &id in &kb.blocks[shi] {
+                        let take = rem.min(KB_BLK);
+                        let a = kb.arenas[(id >> 24) as usize];
+                        // SAFETY: inside the arena
+                        bp.push((unsafe { a.add((id & 0xFF_FFFF) as usize * KB_BLK) }, take));
+                        rem -= take;
+                    }
+                }
+                if nk == 0 {
+                    return;
+                }
+                assert!(bp.len() * KB_BLK < (1 << 24) - 1, "dedup shard too large for 24-bit slot index");
+                // SAFETY: slots below each block's count were written by the parser
+                let key_at = |j: usize| -> &DKey { unsafe { &*bp[j / KB_BLK].0.add(j % KB_BLK) } };
+                let cap = (nk * 2 + 1).next_power_of_two();
+                let mask = cap - 1;
+                const LO: u64 = (1 << 24) - 1;
+                tab.clear();
+                tab.resize(cap, 0);
+                for (b, &(ptr, cnt)) in bp.iter().enumerate() {
+                    // SAFETY: as above
+                    let blk = unsafe { std::slice::from_raw_parts(ptr, cnt) };
+                    for (o, k) in blk.iter().enumerate() {
+                        let i = b * KB_BLK + o;
+                        let hi = k.eh & !LO;
+                        let mut slot = (k.eh.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & mask;
+                        loop {
+                            let t = tab[slot];
+                            if t == 0 {
+                                tab[slot] = hi | (i as u64 + 1);
+                                break;
+                            }
+                            if t & !LO == hi {
+                                let j = (t & LO) as usize - 1;
+                                let kj = key_at(j);
+                                if kj.eh == k.eh && kj.eh2 == k.eh2 {
+                                    // same event: keep the earliest ingest; on a tie the earlier copy (file order) stays
+                                    if k.ing < kj.ing {
+                                        tab[slot] = hi | (i as u64 + 1);
+                                        lose(kj.loc);
+                                    } else {
+                                        lose(k.loc);
+                                    }
+                                    break;
+                                }
+                            }
+                            slot = (slot + 1) & mask;
+                        }
+                    }
+                }
+                return;
+            }
+            let ks: &[DKey] = &key_all[key_off[shi]..key_off[shi + 1]];
             if ks.is_empty() {
                 return;
             }
@@ -3749,6 +4056,8 @@ last,b,c,d,e,f,g"#
     );
     lap("  dedup table");
     drop(key_all);
+    drop(hold);
+    drop(kbs);
     lap("  drop keys");
     lap("events deduped");
     let pay_refs: Vec<&[UEv]> = pays.iter().map(|v| v.as_slice()).collect();
