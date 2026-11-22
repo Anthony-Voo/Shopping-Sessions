@@ -80,3 +80,24 @@ organizers' stated ~20% machine-to-machine spread; locally v63 is 2% faster at 2
 - Exact: SELFTEST ok; gate PASS (with the dev-answer hash line skipped: the kit's dev answer was re-issued Nov 21 19:55, after
   gate.sha256; v63 and v64 MATCH the current one); difftest seeds 611 and 612 (window Apr 22 -> May 6) MATCH;
   20M NCPU=1 Parquet cmp-identical to v63, NCPU=8 canonical table hashes identical.
+
+## Nov 22 ~11:00 UTC: v65 = v64 + branch-free id hash + one gather less for ingest_ts (parser)
+- Upper bounds measured on v64's parser (1 thread, p20m, pieces stubbed out, not exact): full 60.3 ns/line; the two id
+  hashes replaced by one multiply 44.6; timestamps skipped 42.6-46.3; record pushes skipped ~57; event type skipped ~59.5.
+  So the id hash was the largest single piece (~16 ns), not the timestamps. Earlier wyhash/AES/XXH3 variants tied because they
+  kept a length-dependent loop: 1 in 8 ids is 33 bytes (4 words) and the rest 9 bytes (1 word), so the loop's exit branch
+  mispredicts on about a quarter of the lines (the "lines sorted by shape" test never sorted by id length).
+- New h12: ids up to 40 bytes are read with one zero-padded AVX-512 masked load (masked-off bytes cannot fault, so nothing
+  past the slice is read) and hashed with a fixed sequence of four 128-bit multiplies (two independent, chain depth 3); longer
+  inputs fold further word pairs (h12_long). The same function everywhere (events, clicks, links, products); h12_over == h12.
+  SELFTEST: h12 == scalar reference on every event id of the input and on 20k fuzz slices (lengths 0..100, all alignments);
+  no 96-bit collision among the sampled event ids.
+- ts8g for the F1-only form (ingest_ts) no longer gathers the unused fourth word.
+- Output: the hash moves users/events between shards, so part files are no longer byte-identical to v63 (row order inside
+  parts); the tables as sorted sets are identical (ws/canon.py: user_daily 2221326 rows 196b836f85761f1f941dac91,
+  campaign_daily 28014 rows 357f8931a73b4718889f740e, same as v63/v64), v5 dev answer MATCH, gate PASS (hash line skipped),
+  difftests 621/622 MATCH (hash alone), 612 (month-crossing) and 631 MATCH (final).
+- 60M (v5, warm, NCPU=8, ws/ab60.sh): hash alone vs v64: +3.8% (7/12) and a noisy second set; pooled clean-run medians
+  4.023 -> 3.848 (+4.4%), 4/5 clean pairs; 20M +5.4% (6/12). Ingest gather tweak on top: +3.1% (7/12), parse lines 1.433 -> 1.332.
+- PGO retrain for this source: inconclusive/noisy (one set, 1 clean pair); v63's profile kept, as every earlier retrain.
+- Final v65 binary vs v64, 60M 12 rounds: 4.585 -> 4.091 (+10.8%, 7/12), clean medians 4.076 -> 3.941 (+3.3%).

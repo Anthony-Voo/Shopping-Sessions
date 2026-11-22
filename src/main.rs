@@ -48,53 +48,101 @@ fn mum(a: u64, b: u64) -> (u64, u64) {
     (r as u64, (r >> 64) as u64)
 }
 
-/// Shared finish of h12 / h12_over: from the chain state and the masked tail word, two
-/// well-mixed 64-bit outputs (two 128-bit multiplies).
+const HS: [u64; 8] = [
+    0xA076_1D64_78BD_642F,
+    0xE703_7ED1_A0B4_28DB,
+    0x8EBC_6AF0_9C88_C6E3,
+    0x5899_65CC_7537_4CC3,
+    0x1D8E_4E27_C47D_124F,
+    0x9E37_79B9_7F4A_7C15,
+    0xC2B2_AE3D_27D4_EB4F,
+    0x1656_67B1_9E37_79F9,
+];
+
+/// Core of h12 for inputs of at most 40 bytes, given their five zero-padded little-endian words:
+/// a fixed sequence of four 128-bit multiplies (the first two independent), no loop and no
+/// length-dependent branch: ids of 9 and 33 bytes take exactly the same instructions, so their mix
+/// in the input costs no branch mispredicts. (Mixing: words 0-1 and 2-3 each become a 128-bit
+/// product, the two products and word 4 + length become a third, and a fourth finishes.)
 #[inline(always)]
-fn h12_fin(h: u64, t: u64, len: u64) -> (u64, u64) {
-    let (a, b) = mum(h ^ t ^ 0xE703_7ED1_A0B4_28DB, len ^ 0x8EBC_6AF0_9C88_C6E3);
-    let (c, d) = mum(a ^ 0x5899_65CC_7537_4CC3, b ^ 0x1D8E_4E27_C47D_124F);
-    (a ^ b, c ^ d)
+fn h12_words(q: [u64; 5], len: u64) -> (u64, u64) {
+    let (l1, h1) = mum(q[0] ^ HS[0], q[1] ^ HS[1]);
+    let (l2, h2) = mum(q[2] ^ HS[2], q[3] ^ HS[3]);
+    let (l3, h3) = mum(l1 ^ l2 ^ HS[4], h1 ^ h2 ^ q[4] ^ len.wrapping_mul(HS[5]));
+    let (l4, h4) = mum(l3 ^ HS[6], h3 ^ HS[7]);
+    (l4 ^ h4, l4)
 }
 
-/// h12 for a field that is followed by at least 8 more bytes of the same line (event_id and
-/// user_id are fields 0 and 1, so ts, ingest_ts, ... always follow): the tail is read with one
-/// masked 8-byte load instead of a byte loop. Identical results to h12 (checked by SELFTEST).
+/// Little-endian word i (bytes 8i..8i+8) of b, zero padded; 0 beyond the end.
+#[inline(always)]
+fn word_at(b: &[u8], i: usize) -> u64 {
+    let s = 8 * i;
+    if s >= b.len() {
+        return 0;
+    }
+    let n = (b.len() - s).min(8);
+    let mut t = [0u8; 8];
+    t[..n].copy_from_slice(&b[s..s + n]);
+    u64::from_le_bytes(t)
+}
+
+/// Reference h12: plain scalar code for every length (SELFTEST checks h12 against it).
+fn h12_ref(b: &[u8]) -> (u64, u64) {
+    let len = b.len();
+    if len <= 40 {
+        return h12_words([word_at(b, 0), word_at(b, 1), word_at(b, 2), word_at(b, 3), word_at(b, 4)], len as u64);
+    }
+    h12_long(b)
+}
+
+/// h12 for inputs over 40 bytes: words 0-3 as in h12_words, then every further pair of words
+/// folded into the second product, word 4's slot empty.
+#[inline(never)]
+fn h12_long(b: &[u8]) -> (u64, u64) {
+    let len = b.len() as u64;
+    let (l1, h1) = mum(word_at(b, 0) ^ HS[0], word_at(b, 1) ^ HS[1]);
+    let (mut l2, mut h2) = mum(word_at(b, 2) ^ HS[2], word_at(b, 3) ^ HS[3]);
+    let mut k = 4;
+    while 8 * k < b.len() {
+        let (a, c) = mum(l2 ^ word_at(b, k) ^ HS[2], h2 ^ word_at(b, k + 1) ^ HS[3]);
+        l2 = a;
+        h2 = c;
+        k += 2;
+    }
+    let (l3, h3) = mum(l1 ^ l2 ^ HS[4], h1 ^ h2 ^ len.wrapping_mul(HS[5]));
+    let (l4, h4) = mum(l3 ^ HS[6], h3 ^ HS[7]);
+    (l4 ^ h4, l4)
+}
+
+/// Both hashes of a byte string: (h64(b), h2(b)). Up to 40 bytes: one zero-padded masked
+/// 64-byte load (masked-off bytes cannot fault, so nothing past the slice is touched) and
+/// h12_words; longer: h12_long. Identical to h12_ref (SELFTEST).
+#[inline(always)]
+fn h12(b: &[u8]) -> (u64, u64) {
+    let len = b.len();
+    if len > 40 {
+        return h12_long(b);
+    }
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "bmi2"))]
+    // SAFETY: the masked load reads only the first len bytes (all inside b); the store target is
+    // a 64-byte local
+    unsafe {
+        use std::arch::x86_64::*;
+        let k: __mmask64 = _bzhi_u64(u64::MAX, len as u32);
+        let v = _mm512_maskz_loadu_epi8(k, b.as_ptr() as *const i8);
+        let mut q = [0u64; 8];
+        _mm512_storeu_si512(q.as_mut_ptr() as *mut _, v);
+        return h12_words([q[0], q[1], q[2], q[3], q[4]], len as u64);
+    }
+    #[allow(unreachable_code)]
+    h12_words([word_at(b, 0), word_at(b, 1), word_at(b, 2), word_at(b, 3), word_at(b, 4)], len as u64)
+}
+
+/// Same as h12 (kept for the call sites that used the over-reading variant; h12 no longer
+/// reads past the slice).
 #[inline(always)]
 fn h12_over(b: &[u8]) -> (u64, u64) {
-    let len = b.len() as u64;
-    let mut h: u64 = 0xA076_1D64_78BD_642F ^ len.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let mut i = 0;
-    while i + 8 <= b.len() {
-        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        let (lo, hi) = mum(h ^ w, 0xE703_7ED1_A0B4_28DB);
-        h = lo ^ hi;
-        i += 8;
-    }
-    let rem = b.len() - i;
-    // SAFETY: callers guarantee >= 8 readable bytes after the field (same mapped line)
-    let raw = unsafe { std::ptr::read_unaligned(b.as_ptr().add(i) as *const u64) };
-    let t = if rem == 0 { 0 } else { raw & (u64::MAX >> (64 - 8 * rem)) };
-    h12_fin(h, t, len)
-}
-
-/// Both hashes in one pass over the bytes: (h64(b), h2(b)).
-#[inline]
-fn h12(b: &[u8]) -> (u64, u64) {
-    let len = b.len() as u64;
-    let mut h: u64 = 0xA076_1D64_78BD_642F ^ len.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let mut i = 0;
-    while i + 8 <= b.len() {
-        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        let (lo, hi) = mum(h ^ w, 0xE703_7ED1_A0B4_28DB);
-        h = lo ^ hi;
-        i += 8;
-    }
-    let mut t = 0u64;
-    for (k, &c) in b[i..].iter().enumerate() {
-        t |= (c as u64) << (8 * k);
-    }
-    h12_fin(h, t, len)
+    h12(b)
 }
 
 /// Independent second hash: (h64, h2) together identify a string (2^-128 collision odds).
@@ -1773,7 +1821,9 @@ fn ts8g<const ALL: bool>(base: *const u8, off: &[i64; 8], n: &[u64; 8], out: &mu
     unsafe {
         let o = _mm512_loadu_si512(off.as_ptr() as *const __m512i);
         let g = |k: usize| _mm512_i64gather_epi64::<1>(o, base.add(8 * k) as *const i64);
-        ts8v::<ALL>(g(0), g(1), g(2), g(3), _mm512_loadu_si512(n.as_ptr() as *const __m512i), out)
+        // the F1-only form (ingest_ts) never reads bytes 24..32: no fourth gather for it
+        let v3 = if ALL { g(3) } else { _mm512_setzero_si512() };
+        ts8v::<ALL>(g(0), g(1), g(2), v3, _mm512_loadu_si512(n.as_ptr() as *const __m512i), out)
     }
 }
 
@@ -3510,11 +3560,39 @@ last,b,c,d,e,f,g"#
             scan_lines::<7>(c, |r| {
                 if let Some(f) = r {
                     for x in [f[0], f[1]].into_iter().flatten() {
-                        assert_eq!(h12_over(x), h12(x), "hash mismatch");
+                        assert_eq!(h12(x), h12_ref(x), "hash mismatch");
                         hashed += 1;
                     }
                 }
             });
+        }
+        // every length 0..=100 at every alignment, random bytes (crosses the 40-byte and 64-byte forms)
+        let mut fuzz: Vec<u8> = (0..4096).map(|_| rnd() as u8).collect();
+        fuzz.extend_from_slice(b"e7a2dd8b7a1bb4b1b689b76b30875a5ce,u9u72q2cz,1815409540000");
+        for start in 0..200usize {
+            for len in 0..=100usize {
+                let x = &fuzz[start..start + len];
+                assert_eq!(h12(x), h12_ref(x), "hash mismatch at {start}+{len}");
+                hashed += 1;
+            }
+        }
+        // distinct short ids never collide in both words (sanity of the mixing on this data)
+        {
+            let mut seen: FxHashMap<(u64, u64), B> = FxHashMap::default();
+            let mut n = 0u64;
+            for c in chunks(&ev_bufs).into_iter().take(2) {
+                scan_lines::<7>(c, |r| {
+                    if let Some([Some(e), ..]) = r {
+                        if let Some(&o) = seen.get(&h12(e)) {
+                            assert_eq!(o, e, "96-bit hash collision between two different event ids");
+                        } else {
+                            seen.insert(h12(e), e);
+                        }
+                        n += 1;
+                    }
+                });
+            }
+            eprintln!("SELFTEST ok: no hash collision among {n} event ids of the first chunks");
         }
         eprintln!("SELFTEST ok: fast hash identical on {hashed} ids");
         let prods: FxHashMap<B, u32> = small_table(&data.join("products.csv"))
