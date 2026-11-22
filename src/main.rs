@@ -4032,10 +4032,20 @@ last,b,c,d,e,f,g"#
         let roots = &roots_by_shard[sh];
         if l < roots.len() { roots[l] } else { unl_names_by_shard[sh][l - roots.len()] }
     };
+    // sessionize needs only (person, time) per event: 8-byte keys go through the person partition;
+    // the purchases (~3% of events) carry price and category on a small side stream (one buffer
+    // per worker thread, then partitioned by person shard like everything else)
+    let pur_bufs: Vec<std::sync::Mutex<Vec<PR>>> = (0..rayon::current_num_threads().max(1)).map(|_| std::sync::Mutex::new(Vec::new())).collect();
     let (mut pev_all, pev_off) = partition_map(&uev_parts, pcs, |pi, i, e: &UEv| {
         let pid = epid_all[uev_off[pi] + i];
-        ((pid >> PL_BITS) as usize, PR { key: ((pid as u64) << 32) | e.ts as u64, price: e.price, cat: e.cat })
+        let key = ((pid as u64) << 32) | e.ts as u64;
+        if e.price > 0 {
+            let ti = rayon::current_thread_index().unwrap_or(0) % pur_bufs.len();
+            pur_bufs[ti].lock().unwrap().push(PR { key, price: e.price, cat: e.cat });
+        }
+        ((pid >> PL_BITS) as usize, key)
     });
+    let (mut pur_all, pur_off) = partition(pur_bufs.into_iter().map(|m| m.into_inner().unwrap()).collect(), |r: &PR| ({ r.key } >> (32 + PL_BITS)) as usize);
     drop(uev_parts);
     drop(uev_all);
     drop(epid_all);
@@ -4058,8 +4068,10 @@ last,b,c,d,e,f,g"#
         events: u32,
         top: u32,
     }
+    let n_pev = pev_all.len();
     let pev_slices = shard_slices(&mut pev_all, &pev_off);
     let pcl_slices = shard_slices(&mut pcl_all, &pcl_off);
+    let pur_slices = shard_slices(&mut pur_all, &pur_off);
     // dense campaign x day accumulators (sessions start inside the window, so days are bounded)
     let day0 = ws.div_euclid(DAY) as i32;
     let ndays = ((we - 1).div_euclid(DAY) as i32 - day0 + 1) as usize;
@@ -4071,8 +4083,9 @@ last,b,c,d,e,f,g"#
     let cbase = ws - WEEK;
     // largest shards first, one shard per task: a shard holding a whale user (5x the mean) starts
     // at once instead of being picked up last while the other threads sit idle
-    let mut work: Vec<(usize, (&mut [PR], &mut [CR]))> = pev_slices.into_iter().zip(pcl_slices).enumerate().collect();
-    work.sort_unstable_by_key(|(_, (e, c))| std::cmp::Reverse(e.len() + c.len()));
+    let mut work: Vec<(usize, (&mut [u64], &mut [CR], &mut [PR]))> =
+        pev_slices.into_iter().zip(pcl_slices).zip(pur_slices).map(|((e, c), p)| (e, c, p)).enumerate().collect();
+    work.sort_unstable_by_key(|(_, (e, c, _))| std::cmp::Reverse(e.len() + c.len()));
     // one campaign x day accumulator per thread (reused across its shards), not one per task
     let nthreads = rayon::current_num_threads();
     // per (campaign, day): revenue + three session counts in 24 bytes (was 4 x i64 = 32)
@@ -4089,7 +4102,7 @@ last,b,c,d,e,f,g"#
     #[derive(Default)]
     struct Scratch {
         u: [Vec<u32>; 8],
-        eg: Vec<PR>,              // the shard's purchases, sorted by (person, ts)
+        eg: Vec<PR>,              // (unused)
         cg: Vec<CR>,
         ets: Vec<u32>,            // event times (ts - window_start) grouped by person
         agg: Vec<[u32; 3]>,       // per time bucket of one person: min ts, max ts, events
@@ -4107,12 +4120,16 @@ last,b,c,d,e,f,g"#
     const _: () = assert!((1i64 << SBITS) <= GAP);
     // output rows: one growing buffer per thread (large, so huge-page backed) instead of a small
     // vector per shard; the writer groups rows by thread anyway
-    let rowsv: Vec<std::sync::Mutex<Vec<URow>>> = (0..nthreads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    // pre-sized to twice an even share of a generous row estimate (one row per ~4 events; ~9 in
+    // practice), so the buffers do not grow by doubling (each doubling copied everything written
+    // so far); untouched capacity costs nothing
+    let row_cap = (n_pev / 4 / nthreads.max(1)) * 2 + 1024;
+    let rowsv: Vec<std::sync::Mutex<Vec<URow>>> = (0..nthreads).map(|_| std::sync::Mutex::new(Vec::with_capacity(row_cap))).collect();
     let scrs: Vec<std::sync::Mutex<Scratch>> = (0..nthreads).map(|_| std::sync::Mutex::new(Scratch::default())).collect();
     let mut results: Vec<(Vec<URow>, Vec<CampAcc>)> = work
         .into_par_iter()
         .with_max_len(1)
-        .map(|(sh, (evin, cls))| {
+        .map(|(sh, (evin, cls, pur))| {
             let ti = rayon::current_thread_index().unwrap_or(0) % nthreads;
             let mut rguard = rowsv[ti].lock().unwrap();
             let urows: &mut Vec<URow> = &mut rguard;
@@ -4142,14 +4159,10 @@ last,b,c,d,e,f,g"#
             let li = |key: u64| -> usize { ((key >> 32) as u32 - base) as usize };
             eoff.clear();
             eoff.resize(np + 1, 0);
-            // events: count per person and set the (few) purchases aside, then scatter only the
-            // 4-byte times by person (a counting sort; the order inside a person does not matter)
-            eg.clear();
-            for r in evin.iter() {
-                eoff[li(r.key) + 1] += 1;
-                if r.price > 0 {
-                    eg.push(*r);
-                }
+            // events: count per person, then scatter only the 4-byte times by person (a counting
+            // sort; the order inside a person does not matter)
+            for &k in evin.iter() {
+                eoff[li(k) + 1] += 1;
             }
             for p in 0..np {
                 eoff[p + 1] += eoff[p];
@@ -4160,14 +4173,14 @@ last,b,c,d,e,f,g"#
             ets.reserve(evin.len());
             // SAFETY: every slot in 0..evin.len() is written exactly once below (u32: any bits valid)
             unsafe { ets.set_len(evin.len()) };
-            for r in evin.iter() {
-                let k = r.key;
+            for &k in evin.iter() {
                 let l = li(k);
                 ets[pos[l] as usize] = k as u32;
                 pos[l] += 1;
             }
             // purchases in (person, ts) order: each session takes its own as the persons are walked
-            eg.sort_unstable_by_key(|r| r.key);
+            pur.sort_unstable_by_key(|r| r.key);
+            let pur = &*pur;
             let mut pi = 0usize;
             coff.clear();
             coff.resize(np + 1, 0);
@@ -4297,8 +4310,8 @@ last,b,c,d,e,f,g"#
                     // (earlier persons' and sessions' purchases are already taken)
                     let (mut rev, mut purch) = (0i64, false);
                     let last_key = ((pid as u64) << 32) | mx_rel as u64;
-                    while pi < eg.len() && { eg[pi].key } <= last_key {
-                        let x = eg[pi];
+                    while pi < pur.len() && { pur[pi].key } <= last_key {
+                        let x = pur[pi];
                         purch = true;
                         rev += x.price as i64;
                         let xc = if x.cat == u16::MAX { UNKNOWN_CAT } else { x.cat as u32 };

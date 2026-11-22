@@ -137,3 +137,20 @@ organizers' stated ~20% machine-to-machine spread; locally v63 is 2% faster at 2
 - Exact: gate PASS (hash line skipped), SELFTEST, difftests 612 (month-crossing) and 651 MATCH, 20M and 60M outputs MATCH v66,
   and an adversarial set (data/edge-bucket: 211k events on bucket/day/window edges, gaps of GAP-1 / GAP / GAP+1, dense
   buckets, whales, equal timestamps, links) MATCH the Python oracle at NCPU=8 and NCPU=1.
+- Tried on top of v67, dropped (tie): attribution without sorting clicks. For people with <= 64 sessions a click serves the
+  sessions j..k (j = sessions starting before it, k = sessions starting within a week after it), so credit is the latest click
+  per j carried forward and assists are per-campaign 64-bit session masks intersected with per-day masks; clicks then need only a
+  person scatter (no radix, no fix-up), people with > 64 sessions keep the sorted sliding window. Plus assisted counts in their own
+  compact array and pre-sized row buffers. Exact (gate-level checks: dev, adversarial set vs oracle, 20M == v66).
+  60M vs v67, 12 rounds: sessionize 0.702 -> 0.693 s, clean total +1.6% (2 of 3 clean pairs), all runs -14% (noise hits): tie.
+  Counters (20M): the click sort it removes (~22% of the stage) is replaced by about as much per-click and per-(campaign, day)
+  work; the 2,926 people with > 64 sessions hold 10% of sessions and 19% of clicks. Patch: /tmp/claude-0/attr_masks_v68c.patch.
+
+## Nov 22 ~11:50 UTC: v68 = v67 + 8-byte keys through the person partition, purchases on a side stream
+- Since v67 sessionize needs only (person, time) per event, the person partition writes u64 keys (person << 32 | ts) instead
+  of 14-byte PR records; purchases (~3% of events) are pushed as PR records to one buffer per worker thread inside the same
+  pass, partitioned by person shard, and sorted per shard by (person, ts) in sessionize. Row buffers are pre-sized.
+- 60M vs v67 (12 rounds): 9/12; regroup 0.637 -> 0.518 s, sessionize 0.704 -> 0.606 s; clean total 4.266 -> 4.018 (+5.8%,
+  2 of 3 clean pairs); peak RSS 11.76 -> 11.64 GB.
+- Exact: gate PASS (hash line skipped), SELFTEST, difftests 616 (Apr -> May) and 661 MATCH, 20M and 60M MATCH v66,
+  adversarial set (data/edge-bucket) MATCH the oracle at NCPU=8 and 1, dev MATCH at NCPU=3.
