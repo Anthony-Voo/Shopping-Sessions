@@ -61,3 +61,7 @@ Assumed to be the frozen commit 5b5058b (v59). Local warm NCPU8 20M median 1.223
 - v59 and v60 both exact on v5 data: v5 dev answer MATCH, oracle seeds 501-503 MATCH.
 - v60 vs v59: win where a window spans two months (60M -2.4%, 10/12 faster), tie otherwise. Clean build of bf91689 with
   docker --network=none --no-cache OK; container output MATCH v5 dev answer. Not submitted (user submits).
+
+## Nov 22 ~06:15 UTC: board ~0.90 s (user report)
+Assumed to be v63 (73501a31afb2b7131a3311387f7df5131e32cbbb), the last commit handed over; was 0.9663 s with v59.
+v63 local warm NCPU8 on v5 20M: median 1.276 s -> board/local ~0.70.
