@@ -3457,6 +3457,8 @@ last,b,c,d,e,f,g"#
     // vector per shard; the writer groups rows by thread anyway
     let rowsv: Vec<std::sync::Mutex<Vec<URow>>> = (0..nthreads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
     let scrs: Vec<std::sync::Mutex<Scratch>> = (0..nthreads).map(|_| std::sync::Mutex::new(Scratch::default())).collect();
+    // CLKSORT=radix keeps the old whole-shard click radix (A/B and exactness checks)
+    let click_radix = std::env::var("CLKSORT").as_deref() == Ok("radix");
     let mut results: Vec<(Vec<URow>, Vec<CampAcc>)> = work
         .into_par_iter()
         .with_max_len(1)
@@ -3507,7 +3509,15 @@ last,b,c,d,e,f,g"#
             cg.reserve(ncl);
             // SAFETY: every slot in 0..ncl is written exactly once below
             unsafe { cg.set_len(ncl) };
-            radix_22(cls, &mut cg, |c: &CR| (c.key as u32) >> 9, |c: &CR| coff[li(c.key) + 1] += 1);
+            if click_radix {
+                radix_22(cls, &mut cg, |c: &CR| (c.key as u32) >> 9, |c: &CR| coff[li(c.key) + 1] += 1);
+            } else {
+                // persons have few clicks (~3.5 on average), so the whole-shard radix by time is
+                // skipped: group by person in input order and sort each person's clicks below
+                for c in cls.iter() {
+                    coff[li(c.key) + 1] += 1;
+                }
+            }
             for p in 0..np {
                 coff[p + 1] += coff[p];
             }
@@ -3541,7 +3551,15 @@ last,b,c,d,e,f,g"#
                 // eligible click is the winner (latest ts, then smallest click_id): fix equal-ts runs
                 let (c0, c1) = (coff[p] as usize, coff[p + 1] as usize);
                 let pcl = &mut cg[c0..c1];
-                let eq = insertion_fix_eq(pcl, |c: &CR| c.key);
+                // both paths give the stable sort of the input order by key: the radix path is a
+                // stable sort by ts >> 9 finished by a stable insertion sort; the person path is a
+                // stable insertion sort (short runs) or a stable merge sort (long runs)
+                let eq = if click_radix || pcl.len() <= 32 {
+                    insertion_fix_eq(pcl, |c: &CR| c.key)
+                } else {
+                    pcl.sort_by_key(|c: &CR| c.key);
+                    pcl.windows(2).any(|w| w[0].key == w[1].key)
+                };
                 if eq {
                     let mut a = 0;
                     while a < pcl.len() {
