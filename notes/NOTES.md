@@ -68,3 +68,15 @@ v63 local warm NCPU8 on v5 20M: median 1.276 s (v59 ~1.30) -> board/local ~0.78.
 organizers' stated ~20% machine-to-machine spread; locally v63 is 2% faster at 20M and ~5-8% at 60M.
 - Nov 22: v63 resubmitted: board 0.9795 s (user report). v63 board runs so far: 0.99, 0.9795; v59: 0.9663 (one run, likely a fast machine).
   Local head-to-head v59 vs v63 (12 interleaved runs, warm, NCPU8): v5 20M 1.249 -> 1.203 (-3.8%, 9/12); v5 60M 3.894 -> 3.720 (-4.5%, 12/12).
+
+## Nov 22 ~10:00 UTC: v64 = v63 + links thread changes (candidate)
+- Rayon workers start at nice 10 (env WORKER_NICE, 0 = off); the links thread stays at nice 0. On v63 the links thread
+  finished at ~1.76-1.95 s, i.e. at or after the end of parsing, time-slicing with the parse/dedup workers; now it is done at ~0.76 s.
+- Links union-find in a second pass over the interned id pairs, parent[] prefetched 16 pairs ahead (intern + union-find
+  0.48-0.51 s -> ~0.38 s on the links thread); `pairs` and the per-id vectors pre-sized. Roots do not depend on union order.
+- 60M (v5 data, warm, NCPU=8, ws/ab60.sh interleaved, all 24 runs clean): v63 4.252 -> v64 4.037 s median (-5.0%), 15/24
+  rounds (sets: 7/12 -3.5%, 8/12 -6.6%); parse lap 2.140 -> 1.791. 20M: tie (1.167 -> 1.182, 5/12).
+- PGO: profile regenerated for this source lost (-3.7%, 5/12 at 60M): v63's pgo/merged.profdata kept (same as every earlier retrain).
+- Exact: SELFTEST ok; gate PASS (with the dev-answer hash line skipped: the kit's dev answer was re-issued Nov 21 19:55, after
+  gate.sha256; v63 and v64 MATCH the current one); difftest seeds 611 and 612 (window Apr 22 -> May 6) MATCH;
+  20M NCPU=1 Parquet cmp-identical to v63, NCPU=8 canonical table hashes identical.

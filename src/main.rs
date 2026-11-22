@@ -2968,7 +2968,24 @@ fn main() {
     };
     let ncpu: usize = env("NCPU", "0").parse().unwrap_or(0);
     let ncpu = if ncpu == 0 { std::thread::available_parallelism().map_or(8, |n| n.get()) } else { ncpu };
-    rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().ok();
+    // rayon workers run at a lower priority (nice WORKER_NICE, default 10) than the links thread, so
+    // the links thread finishes while events are parsed instead of time-slicing with dedup
+    // (raising a thread's own nice value needs no privilege)
+    let wnice: i32 = env("WORKER_NICE", "10").parse().unwrap_or(10);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(ncpu)
+        .start_handler(move |_| {
+            if wnice != 0 {
+                unsafe extern "C" {
+                    fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+                    fn gettid() -> i32;
+                }
+                // SAFETY: plain libc calls on this thread's own id
+                unsafe { setpriority(0, gettid() as u32, wnice) };
+            }
+        })
+        .build_global()
+        .ok();
     let lap = |what: &str| eprintln!("{:>8.3}s {what}", t0.elapsed().as_secs_f64());
 
     // manifest (tiny JSON): pull the two ISO strings out
@@ -3024,7 +3041,9 @@ fn main() {
     let links_job = std::thread::spawn(move || {
     let lt0 = Instant::now();
     // links: union-find, root kept as byte-wise smallest ID
-    let mut pairs: Vec<(B, B)> = Vec::new();
+    // pre-sized from the input (links lines average ~20 B): no doubling copies into fresh memory
+    let ln_bytes: usize = ln_bufs2.iter().map(|b| b.len()).sum();
+    let mut pairs: Vec<(B, B)> = Vec::with_capacity(ln_bytes / 16 + 16);
     for &c in chunks(&ln_bufs2).iter() {
         scan_lines3::<2>(c, |r| {
             if let Some([Some(a), Some(b)]) = r {
@@ -3124,10 +3143,14 @@ fn main() {
             (ha, ha2 as u32, hb, hb2 as u32)
         })
         .collect();
-    let mut h2s: Vec<u32> = Vec::new(); // low 32 bits of h2 per interned ID (fast path only)
+    let id_cap = pairs.len() * 3 / 2 + 16; // typical: ~1.35 IDs per pair (grows if more)
+    it.names.reserve(id_cap);
+    it.hashes.reserve(id_cap);
+    it.parent.reserve(id_cap);
+    let mut h2s: Vec<u32> = Vec::with_capacity(id_cap); // low 32 bits of h2 per interned ID (fast path only)
     // first 8 bytes of each interned ID, big-endian and zero-padded: orders IDs byte-wise
     // whenever two prefixes differ, without chasing the name pointers (equal -> full compare)
-    let mut pfx: Vec<u64> = Vec::new();
+    let mut pfx: Vec<u64> = Vec::with_capacity(id_cap);
     let pfx_of = |n: B| -> u64 {
         let mut w = [0u8; 8];
         let k = n.len().min(8);
@@ -3139,6 +3162,7 @@ fn main() {
         let cap = (pairs.len() * 2).max(1024).next_power_of_two(); // <= ~60% full (ids <= 2x pairs, usually ~1.35x)
         let mask = cap - 1;
         let mut tab = vec![ISlot { k: 0, id: 0, h2: 0 }; cap];
+        let mut idp: Vec<(u32, u32)> = Vec::with_capacity(pairs.len());
         let slot_of = |h: u64| (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24) as usize & mask;
         const AHEAD: usize = 12;
         'pairs: for i in 0..pairs.len() {
@@ -3181,14 +3205,34 @@ fn main() {
                     p = (p + 1) & mask;
                 }
             }
-            let (ra, rb) = (it.find(ids[0]), it.find(ids[1]));
-            if ra != rb {
-                let (pa, pb) = (pfx[ra as usize], pfx[rb as usize]);
-                let a_first = if pa != pb { pa < pb } else { it.names[ra as usize] <= it.names[rb as usize] };
-                let (lo, hi) = if a_first { (ra, rb) } else { (rb, ra) };
-                it.parent[hi as usize] = lo;
+            idp.push((ids[0], ids[1]));
+        }
+        // union pass (separate from interning, same pair order): the parent / prefix reads are
+        // random, so the first hop of the pair 16 ahead is prefetched. Roots do not depend on the
+        // union order (each union keeps the byte-wise smaller root).
+        if fast_ok {
+            const UAHEAD: usize = 16;
+            for i in 0..idp.len() {
+                #[cfg(target_feature = "sse")]
+                if i + UAHEAD < idp.len() {
+                    let (a, b) = idp[i + UAHEAD];
+                    // SAFETY: in-bounds addresses; prefetch has no architectural effect
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(it.parent.as_ptr().add(a as usize) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                        std::arch::x86_64::_mm_prefetch(it.parent.as_ptr().add(b as usize) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                    }
+                }
+                let (a, b) = idp[i];
+                let (ra, rb) = (it.find(a), it.find(b));
+                if ra != rb {
+                    let (pa, pb) = (pfx[ra as usize], pfx[rb as usize]);
+                    let a_first = if pa != pb { pa < pb } else { it.names[ra as usize] <= it.names[rb as usize] };
+                    let (lo, hi) = if a_first { (ra, rb) } else { (rb, ra) };
+                    it.parent[hi as usize] = lo;
+                }
             }
         }
+        drop(idp);
     }
     drop(hs);
     drop(pfx);
