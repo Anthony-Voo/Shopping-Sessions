@@ -289,3 +289,16 @@ PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried 
 - Sessionize split (rdtsc, 60M): event radix+person scatter 39%, click sort 10%, per-person scan 50%; ~5 ns per record per scatter pass: at the scatter floor.
 - Parser stages (PARSESTAGE, 1 thread, 20M): structure 12.4 ns/line, +field bounds/quotes 12.3, +values (ts/ing/type/price/product) 26.4, +hash+write 10.7 = 61.8.
 - C3 campaign lookup through the 96-bit ProdTab table instead of the byte-keyed FxHashMap: exact (gate PASS), u+clicks CPU 1.88 -> 1.88 core-s: no effect, reverted.
+
+## Nov 22 ~03:00 UTC: v60 two-way month caches; v5 data (scorer rescored onto v5 IDs)
+- Found: event ts costs 13.5 ns/line of 62 (PARSESTAGE nots variant); 7 ns with lines shape-sorted, so ~6.5 ns is form-dispatch mispredicts.
+  Branch-free 3-form ts parser: exact (SELFTEST 14M) but 65.8 -> 73 ns/line; F3-branch + merged F1/F2: tie. Both dropped.
+- Found: both month caches (MonthCache for ingest/click ts, thread-local MONTH for event ts) held ONE month; a 14-day window
+  spanning two months (p60m Sep 20-Oct 4; ~45% of seeds) thrashes them on random-order lines.
+- v60 = two-way caches (branch-free pick of the matching entry). SELFTEST 14,013,728 timestamps identical (new fuzz with random
+  months on one shared cache); gate PASS; oracle seeds 239, 240, 9202 (month-spanning) MATCH; v5 generator: dev answer MATCH, seeds 501-503 MATCH.
+  PARSESTAGE 1 thread: month-spanning 20M (seed 9202) 1.62-1.63 -> 1.44-1.49 s (-10%); p20m tie.
+  stimer warm NCPU8 12 rounds vs v59: p60m (spanning) -2.4% (10/12 faster, 6/12 >3%); x20 (spanning) -1.9% (7/12);
+  p20m -0.5% (5/12); v5 n20 (single month) +1.9% (7/12 faster); v5 n60 (single month) -0.0% (4/12). Win where it applies, tie elsewhere.
+- PGO profile retrained on v5 data: n60 +1.5% vs v60 (0/12 >3%): not adopted (v60 keeps the profile made from its source on old-format data).
+- v5 data shape: lines avg 82 B (was 77), 0.49% over the 128 B fast path; v59 and v60 exact on it.

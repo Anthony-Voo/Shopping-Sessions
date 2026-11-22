@@ -1576,7 +1576,8 @@ fn civil(b: &[u8]) -> Option<i64> {
 
 thread_local! {
     // one-entry cache: exact "YYYY-MM-" bytes -> (days at day 1, days in month); month 0 = invalid
-    static MONTH: std::cell::Cell<(u64, i64, i64)> = const { std::cell::Cell::new((u64::MAX, 0, 0)) };
+    // two entries: a 14-day window can span two months, and lines arrive in random time order
+    static MONTH: std::cell::Cell<[(u64, i64, i64); 2]> = const { std::cell::Cell::new([(u64::MAX, 0, 0); 2]) };
 }
 
 /// Fast exact "YYYY-MM-DDTHH:MM:SS" prefix -> epoch ms (same results as civil()).
@@ -1601,9 +1602,11 @@ fn civil_fast(b: &[u8]) -> Option<i64> {
         return None;
     }
     let key = u64::from_le_bytes(b[0..8].try_into().unwrap());
-    let (k, base, mlen) = MONTH.with(|c| c.get());
-    let (base, mlen) = if k == key {
-        (base, mlen)
+    let m = MONTH.with(|c| c.get());
+    let (base, mlen) = if m[0].0 == key {
+        (m[0].1, m[0].2)
+    } else if m[1].0 == key {
+        (m[1].1, m[1].2)
     } else {
         let r = (|| {
             if b[4] != b'-' || b[7] != b'-' {
@@ -1619,7 +1622,7 @@ fn civil_fast(b: &[u8]) -> Option<i64> {
             Some((days_from_civil(y, mo, 1), ml))
         })();
         let (bs, ml) = r.unwrap_or((0, 0));
-        MONTH.with(|c| c.set((key, bs, ml)));
+        MONTH.with(|c| c.set([(key, bs, ml), m[0]]));
         (bs, ml)
     };
     if d < 1 || d > mlen {
@@ -1633,11 +1636,15 @@ struct MonthCache {
     key: u64,
     base: i64,
     mlen: i64,
+    // second entry: a 14-day window can span two months, and lines arrive in random time order
+    key2: u64,
+    base2: i64,
+    mlen2: i64,
 }
 
 impl MonthCache {
     fn new() -> Self {
-        MonthCache { key: u64::MAX, base: 0, mlen: 0 }
+        MonthCache { key: u64::MAX, base: 0, mlen: 0, key2: u64::MAX, base2: 0, mlen2: 0 }
     }
 
     /// Exact F1 "YYYY-MM-DDTHH:MM:SSZ" -> epoch ms; anything else -> parse_ts (identical results).
@@ -1660,30 +1667,55 @@ impl MonthCache {
             return BAD;
         }
         let key = u64::from_le_bytes(b[0..8].try_into().unwrap());
-        if key != self.key {
-            let r = (|| {
-                if b[4] != b'-' || b[7] != b'-' {
-                    return None;
-                }
-                let y = d2(b, 0)? * 100 + d2(b, 2)?;
-                let mo = d2(b, 5)?;
-                if !(1..=12).contains(&mo) {
-                    return None;
-                }
-                let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-                let ml = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(mo - 1) as usize];
-                Some((days_from_civil(y, mo, 1), ml))
-            })();
-            let (bs, ml) = r.unwrap_or((0, 0));
-            self.key = key;
-            self.base = bs;
-            self.mlen = ml;
-        }
-        if d < 1 || d > self.mlen {
+        let (base, mlen) = self.month(b, key);
+        if d < 1 || d > mlen {
             return BAD;
         }
-        (((self.base + d - 1) * 24 + h) * 60 + mi) * 60_000 + s * 1000
+        (((base + d - 1) * 24 + h) * 60 + mi) * 60_000 + s * 1000
     }
+}
+
+impl MonthCache {
+    /// Make the cache hold the month of the 8 bytes `key` (= "YYYY-MM-" of `b`), as f1 does.
+    #[inline(never)]
+    fn load(&mut self, b: &[u8], key: u64) {
+        let r = (|| {
+            if b[4] != b'-' || b[7] != b'-' {
+                return None;
+            }
+            let y = d2(b, 0)? * 100 + d2(b, 2)?;
+            let mo = d2(b, 5)?;
+            if !(1..=12).contains(&mo) {
+                return None;
+            }
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            let ml = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(mo - 1) as usize];
+            Some((days_from_civil(y, mo, 1), ml))
+        })();
+        let (bs, ml) = r.unwrap_or((0, 0));
+        (self.key2, self.base2, self.mlen2) = (self.key, self.base, self.mlen);
+        self.key = key;
+        self.base = bs;
+        self.mlen = ml;
+    }
+
+    /// (first day of the month as days since epoch, month length; 0 if "YYYY-MM-" is invalid) for
+    /// the 8 bytes `key` of `b`: either cached entry is picked without a branch.
+    #[inline(always)]
+    fn month(&mut self, b: &[u8], key: u64) -> (i64, i64) {
+        if (key != self.key) & (key != self.key2) {
+            self.load(b, key);
+        }
+        let a = key == self.key;
+        (sel(a, self.base, self.base2), sel(a, self.mlen, self.mlen2))
+    }
+}
+
+/// Branch-free select: c ? a : b (a data dependency, never a mispredicted branch).
+#[inline(always)]
+fn sel(c: bool, a: i64, b: i64) -> i64 {
+    let m = -(c as i64);
+    (a & m) | (b & !m)
 }
 
 /// 8 ASCII digits (first byte most significant) -> value, if all are '0'..='9'.
@@ -2873,6 +2905,43 @@ fn main() {
             }
             let tb: &'static [u8] = Box::leak(t.into_boxed_slice());
             assert_eq!(mc.f1(Some(tb)), parse_ts_ref(Some(tb)), "f1 mismatch on {:?}", String::from_utf8_lossy(tb));
+            checked += 1;
+        }
+        // two-way month caches (f1's and parse_ts's): mutated templates of every form and length with
+        // random months, each followed by a line tail (parse_ts_over's guarantee), one cache across calls
+        let mut mc2 = MonthCache::new();
+        let tails: [&[u8]; 2] = [b",2026-10-03T23:58:10Z,view,p1,", b",2026-11-01T00:00:00Z,purchase,p2,5"];
+        for it in 0..6_000_000u64 {
+            let mut t: Vec<u8> = templates[(rnd() % 6) as usize].to_vec();
+            for _ in 0..(rnd() % 4) {
+                let i = (rnd() as usize) % t.len();
+                t[i] = b"0123456789-+:TZtz .\xff/"[(rnd() as usize) % 21];
+            }
+            if rnd() % 8 == 0 {
+                t.truncate((rnd() as usize) % t.len() + 1);
+            }
+            if rnd() % 16 == 0 {
+                let k = (rnd() % 14) as usize;
+                t = std::iter::repeat_n(b'0', k).chain(t).collect();
+            }
+            if rnd() % 4 == 0 {
+                // random month/year so the shared month cache keeps changing
+                if t.len() >= 8 && t[4] == b'-' {
+                    t[5] = b'0' + (rnd() % 2) as u8;
+                    t[6] = b'0' + (rnd() % 10) as u8;
+                    t[3] = b'0' + (rnd() % 10) as u8;
+                }
+            }
+            let n = t.len();
+            t.extend_from_slice(tails[(it % 2) as usize]);
+            let pb: &'static [u8] = Box::leak(t.into_boxed_slice());
+            let tb = &pb[..n];
+            assert_eq!(parse_ts_over(Some(tb)), parse_ts_ref(Some(tb)), "two-way month cache (parse_ts) mismatch on {:?}", String::from_utf8_lossy(tb));
+            assert_eq!(mc2.f1(Some(tb)), parse_ts_ref(Some(tb)), "two-way month cache (f1) mismatch on {:?}", String::from_utf8_lossy(tb));
+            if it % 3 == 0 {
+                // interleave ingest-style F1 lookups on the same cache, as the parser does
+                let _ = mc2.f1(Some(&tails[0][1..21]));
+            }
             checked += 1;
         }
         eprintln!("SELFTEST ok: {checked} timestamps identical");
