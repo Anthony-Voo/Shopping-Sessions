@@ -2298,6 +2298,61 @@ struct CR { // 16 bytes, no padding
 const CREF_OFF_BITS: u32 = 22;
 const CREF_OFF_MASK: u32 = (1 << CREF_OFF_BITS) - 1;
 
+/// Finish a batch of up to 8 click lines (click_id, user_id, campaign, ts): all ts at once
+/// through ts8 (scalar parse for forms it does not decide), then each click in order.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn click_batch(c: &'static [u8], cci: usize, pend: &[(B, B, u32, Option<B>); 8], np: usize, ws: i64, we: i64, mc: &mut MonthCache, sh: &mut Vec<UCl>, cc: &mut [u32]) {
+    let cbase = c.as_ptr() as usize;
+    let cend = cbase + c.len();
+    let mut tsv = [0i64; 8];
+    #[cfg(all(target_feature = "avx512bw", target_feature = "avx512dq"))]
+    {
+        let (mut o, mut n) = ([0i64; 8], [0u64; 8]);
+        let mut hi = 0usize;
+        for l in 0..np {
+            if let Some(t) = pend[l].3 {
+                o[l] = (t.as_ptr() as usize - cbase) as i64;
+                n[l] = t.len() as u64;
+                hi = hi.max(o[l] as usize);
+            }
+        }
+        let dec = if hi + 32 <= c.len() {
+            ts8g::<true>(c.as_ptr(), &o, &n, &mut tsv)
+        } else {
+            let mut w = [[0u64; 8]; 4];
+            for l in 0..np {
+                let x = ts_words(c, o[l] as usize);
+                for k in 0..4 {
+                    w[k][l] = x[k];
+                }
+            }
+            ts8::<true>(&w, &n, &mut tsv)
+        };
+        for l in 0..np {
+            if (dec >> l) & 1 == 0 || pend[l].3.is_none() {
+                tsv[l] = mc.f1(pend[l].3);
+            }
+        }
+    }
+    #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512dq")))]
+    for l in 0..np {
+        tsv[l] = mc.f1(pend[l].3);
+    }
+    for l in 0..np {
+        let (cid, uid, camp, _) = pend[l];
+        let ts = tsv[l];
+        if ts == BAD || ts < ws - WEEK || ts >= we {
+            continue;
+        }
+        // one 8-byte load for the id's tail when 8 more bytes of the chunk follow it
+        let (uh, uh2) = if uid.as_ptr() as usize + uid.len() + 8 <= cend { h12_over(uid) } else { h12(uid) };
+        cc[shard_h(uh)] += 1;
+        let cr = |f: B| ((cci as u32) << CREF_OFF_BITS) | (f.as_ptr() as usize - cbase) as u32;
+        sh.push(UCl { uh, uref: cr(uid), cref: cr(cid), uh2: uh2 as u32, ts: (ts - (ws - WEEK)) as u32, camp });
+    }
+}
+
 /// Bytes of a click-line field from its reference: the field ends at its closing quote if the
 /// byte before it is a quote, else at the next comma (click_id and user_id are never last).
 fn cref_name(chunks: &[B], r: u32) -> B {
@@ -2491,6 +2546,17 @@ impl FlatTab {
                 return (i, false);
             }
             i = (i + 1) & self.mask;
+        }
+    }
+    /// Prefetch the first probe slot of k (a lookup a few records ahead).
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        let i = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize;
+        #[cfg(target_feature = "sse")]
+        // SAFETY: i <= mask < keys.len(); prefetch has no architectural effect
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(self.keys.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            std::arch::x86_64::_mm_prefetch(self.vals.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0);
         }
     }
     /// Store (k, v) in the empty slot i returned by probe(k).
@@ -2714,7 +2780,7 @@ fn partition_sized<T: Copy + Send + Sync>(
     // software write-combining: stage each shard's elements in a ~256 B buffer (all buffers
     // together ~256 KB, L2-resident) and flush full buffers as one contiguous burst, so the
     // 1024-way scatter costs one TLB/cache miss per burst instead of one per element
-    // burst = smallest whole number of 64 B lines (>= 192 B) holding whole elements, fixed at
+    // burst = smallest whole number of 64 B lines (>= 768 B) holding whole elements, fixed at
     // compile time, so each flush is a few inline 64 B vector moves rather than a memcpy call
     let e: usize = const {
         let sz = std::mem::size_of::<T>();
@@ -2727,7 +2793,7 @@ fn partition_sized<T: Copy + Send + Sync>(
         }
         let base = 64 / a;
         let mut n = base;
-        while n * sz < 384 {
+        while n * sz < 768 {
             n += base;
         }
         n
@@ -2795,7 +2861,7 @@ fn partition_map<S: Sync, T: Copy + Send + Sync>(
     // software write-combining: stage each shard's elements in a ~256 B buffer (all buffers
     // together ~256 KB, L2-resident) and flush full buffers as one contiguous burst, so the
     // 1024-way scatter costs one TLB/cache miss per burst instead of one per element
-    // burst = smallest whole number of 64 B lines (>= 192 B) holding whole elements, fixed at
+    // burst = smallest whole number of 64 B lines (>= 768 B) holding whole elements, fixed at
     // compile time, so each flush is a few inline 64 B vector moves rather than a memcpy call
     let e: usize = const {
         let sz = std::mem::size_of::<T>();
@@ -2808,7 +2874,7 @@ fn partition_map<S: Sync, T: Copy + Send + Sync>(
         }
         let base = 64 / a;
         let mut n = base;
-        while n * sz < 384 {
+        while n * sz < 768 {
             n += base;
         }
         n
@@ -3605,8 +3671,11 @@ last,b,c,d,e,f,g"#
     };
     // per-thread open-addressing table (reused across shards): one u64 per slot holding the
     // hash's high 40 bits and (index + 1) in the low 24 bits; capacity 2x keys (<= 50% load)
+    // per-thread open-addressing table (reused across shards): one u32 per slot holding an 8-bit
+    // tag of the hash and (index + 1) in the low 24 bits; capacity 2x keys (<= 50% load). A tag
+    // match is checked against the key itself (96-bit identity), so tags only save key reads.
     (0..NSH).into_par_iter().for_each_init(
-        || Vec::<u64>::new(),
+        || Vec::<u32>::new(),
         |tab, shi| {
             let ks = &key_all[key_off[shi]..key_off[shi + 1]];
             if ks.is_empty() {
@@ -3615,32 +3684,32 @@ last,b,c,d,e,f,g"#
             assert!(ks.len() < (1 << 24) - 1, "dedup shard too large for 24-bit slot index");
             let cap = (ks.len() * 2 + 1).next_power_of_two();
             let mask = cap - 1;
-            const LO: u64 = (1 << 24) - 1;
+            const LO: u32 = (1 << 24) - 1;
             tab.clear();
             tab.resize(cap, 0);
             const AHEAD: usize = 8;
+            let slot_of = |eh: u64| (eh.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & mask;
             for (i, k) in ks.iter().enumerate() {
                 // the table outgrows L2 at large sizes: fetch the slot of the key AHEAD places on
                 #[cfg(target_feature = "sse")]
                 if let Some(f) = ks.get(i + AHEAD) {
-                    let fs = (f.eh.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & mask;
-                    // SAFETY: fs <= mask < tab.len(); prefetch has no architectural effect
-                    unsafe { std::arch::x86_64::_mm_prefetch(tab.as_ptr().add(fs) as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+                    // SAFETY: slot_of(..) <= mask < tab.len(); prefetch has no architectural effect
+                    unsafe { std::arch::x86_64::_mm_prefetch(tab.as_ptr().add(slot_of(f.eh)) as *const i8, std::arch::x86_64::_MM_HINT_T0) };
                 }
-                let hi = k.eh & !LO;
-                let mut slot = (k.eh.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & mask;
+                let tag = ((k.eh as u32) & 0xFF) << 24;
+                let mut slot = slot_of(k.eh);
                 loop {
                     let t = tab[slot];
                     if t == 0 {
-                        tab[slot] = hi | (i as u64 + 1);
+                        tab[slot] = tag | (i as u32 + 1);
                         break;
                     }
-                    if t & !LO == hi {
+                    if t & !LO == tag {
                         let j = (t & LO) as usize - 1;
                         if ks[j].eh == k.eh && ks[j].eh2 == k.eh2 {
                             // same event: keep the earliest ingest; on a tie the earlier copy (file order) stays
                             if k.ing < ks[j].ing {
-                                tab[slot] = hi | (i as u64 + 1);
+                                tab[slot] = tag | (i as u32 + 1);
                                 lose(ks[j].loc);
                             } else {
                                 lose(k.loc);
@@ -3680,24 +3749,22 @@ last,b,c,d,e,f,g"#
             let cend = cbase + c.len();
             let mut cc = vec![0u32; NSH];
             let mut mc = MonthCache::new();
+            // clicks wait in batches of 8 so their ts are parsed eight at a time (ts8)
+            let mut pend: [(B, B, u32, Option<B>); 8] = [(b"", b"", 0, None); 8];
+            let mut np = 0usize;
             scan_lines3::<4>(c, |r| {
                 let Some([Some(cid), Some(uid), Some(camp), ts]) = r else { return };
                 let Some(&camp) = campaigns.get(camp) else { return };
-                // 13-digit epoch ms through the SWAR path (reads only the field's own bytes); ISO ...Z
-                // via the month cache; any other form -> parse_ts (identical results either way)
-                let ts = match ts {
-                    Some(t) if t.len() == 13 => parse_ts_over(ts),
-                    _ => mc.f1(ts),
-                };
-                if ts == BAD || ts < ws - WEEK || ts >= we {
-                    return;
+                pend[np] = (cid, uid, camp, ts);
+                np += 1;
+                if np == 8 {
+                    click_batch(c, cci, &pend, np, ws, we, &mut mc, &mut sh, &mut cc);
+                    np = 0;
                 }
-                // one 8-byte load for the id's tail when 8 more bytes of the chunk follow it
-                let (uh, uh2) = if uid.as_ptr() as usize + uid.len() + 8 <= cend { h12_over(uid) } else { h12(uid) };
-                cc[shard_h(uh)] += 1;
-                let cr = |f: B| ((cci as u32) << CREF_OFF_BITS) | (f.as_ptr() as usize - cbase) as u32;
-                sh.push(UCl { uh, uref: cr(uid), cref: cr(cid), uh2: uh2 as u32, ts: (ts - (ws - WEEK)) as u32, camp });
             });
+            if np > 0 {
+                click_batch(c, cci, &pend, np, ws, we, &mut mc, &mut sh, &mut cc);
+            }
             (sh, cc)
         })
         .collect();
@@ -3750,7 +3817,9 @@ last,b,c,d,e,f,g"#
                 assert!(local < PL_MASK, "too many people in one shard");
                 ((shi as u32) << PL_BITS) | local
             };
-            let mut pid_of = |u: NameRef, uh: u64, u2: u64| -> u32 {
+            let mut pid_of = |u: NameRef, uh: u64, u2: u64, ahead: u64| -> u32 {
+                // the table outgrows L2 at large sizes: fetch the slot of a record a few places on
+                tab.prefetch(ahead);
                 let u2 = u2 as u32 as u64; // 96-bit user identity: h64 + low 32 bits of h2
                 if lk_clash {
                     if let Some(i) = it.get(name_of_ref(u), uh) {
@@ -3798,8 +3867,9 @@ last,b,c,d,e,f,g"#
             for (c, counts) in wc_keep.iter().enumerate() {
                 let n = counts[shi] as usize;
                 let base = ev_chunks[c].as_ptr() as usize;
-                for (e, d) in evs[pos..pos + n].iter().zip(prs_out[pos..pos + n].iter_mut()) {
-                    let pid = pid_of(NameRef::Scan(base + e.uoff as usize), e.pk, e.pk2 as u64);
+                for (q, (e, d)) in evs[pos..pos + n].iter().zip(prs_out[pos..pos + n].iter_mut()).enumerate() {
+                    let ahead = evs.get(pos + q + 8).map_or(0, |f| f.pk);
+                    let pid = pid_of(NameRef::Scan(base + e.uoff as usize), e.pk, e.pk2 as u64, ahead);
                     pc[(pid >> PL_BITS) as usize] += 1;
                     *d = pid;
                 }
@@ -3808,8 +3878,9 @@ last,b,c,d,e,f,g"#
             assert!(pos == evs.len(), "user shuffle layout");
             let cls = &ucl_all[ucl_off[shi]..ucl_off[shi + 1]];
             let mut cc = vec![0u32; NSH];
-            for (c, d) in cls.iter().zip(crs_out.iter_mut()) {
-                let pid = pid_of(NameRef::Scan(cl_chunks[(c.uref >> CREF_OFF_BITS) as usize].as_ptr() as usize + (c.uref & CREF_OFF_MASK) as usize), c.uh, c.uh2 as u64);
+            for (q, (c, d)) in cls.iter().zip(crs_out.iter_mut()).enumerate() {
+                let ahead = cls.get(q + 8).map_or(0, |f| f.uh);
+                let pid = pid_of(NameRef::Scan(cl_chunks[(c.uref >> CREF_OFF_BITS) as usize].as_ptr() as usize + (c.uref & CREF_OFF_MASK) as usize), c.uh, c.uh2 as u64, ahead);
                 cc[(pid >> PL_BITS) as usize] += 1;
                 *d = pid;
             }
@@ -4155,25 +4226,47 @@ last,b,c,d,e,f,g"#
     std::fs::create_dir_all(&ud).unwrap();
     std::fs::create_dir_all(&cd).unwrap();
     let cat_name = |c: u32| -> B { if c == UNKNOWN_CAT { b"unknown" } else { cat_names[c as usize] } };
-    let groups: Vec<Vec<Vec<URow>>> = {
-        let mut g: Vec<Vec<Vec<URow>>> = (0..ncpu).map(|_| vec![]).collect();
-        for (i, p) in user_parts.into_iter().enumerate() {
-            g[i % ncpu].push(p);
+    // cut all rows into ncpu groups of about equal size (slices of the per-thread row buffers),
+    // one file each, so no writer waits on an oversized group
+    let total_rows: usize = user_parts.iter().map(|v| v.len()).sum();
+    let per = total_rows.div_ceil(ncpu).max(1);
+    let mut groups: Vec<Vec<&[URow]>> = vec![Vec::new(); ncpu];
+    {
+        let (mut g, mut fill) = (0usize, 0usize);
+        for v in &user_parts {
+            let mut rest: &[URow] = v;
+            while !rest.is_empty() {
+                let take = (per - fill).min(rest.len());
+                groups[g].push(&rest[..take]);
+                rest = &rest[take..];
+                fill += take;
+                if fill == per && g + 1 < ncpu {
+                    g += 1;
+                    fill = 0;
+                }
+            }
         }
-        g
-    };
+    }
     groups.into_par_iter().enumerate().for_each(|(gi, parts)| {
-        let rows: Vec<&URow> = parts.iter().flatten().collect();
+        let rows: Vec<&URow> = parts.iter().flat_map(|p| p.iter()).collect();
+        let n = rows.len();
+        // pages are filled straight from the rows into one reused buffer (no value vectors)
+        let uid = |p: &mut Vec<u8>| pq::str_page(p, n, |i| Some(rows[i].name), false);
+        let day = |p: &mut Vec<u8>| pq::fixed_page::<4>(p, n, |i| rows[i].day.to_le_bytes());
+        // counts are at most the number of events (< 2^31): 32-bit columns, 8 bytes less per row
+        let ses = |p: &mut Vec<u8>| pq::fixed_page::<4>(p, n, |i| (rows[i].sessions as i32).to_le_bytes());
+        let evn = |p: &mut Vec<u8>| pq::fixed_page::<4>(p, n, |i| (rows[i].events as i32).to_le_bytes());
+        let rev = |p: &mut Vec<u8>| pq::fixed_page::<8>(p, n, |i| rows[i].revenue.to_le_bytes());
+        let top = |p: &mut Vec<u8>| pq::str_page(p, n, |i| if rows[i].top == NO_TOP { None } else { Some(cat_name(rows[i].top)) }, true);
         pq::write(
             &ud.join(format!("part-{gi}.parquet")),
             &[
-                ("user_id", pq::Col::Str(rows.iter().map(|r| Some(r.name)).collect(), false)),
-                ("day", pq::Col::Date(rows.iter().map(|r| r.day).collect())),
-                // counts are at most the number of events (< 2^31): 32-bit columns, 8 bytes less per row
-                ("sessions", pq::Col::I32(rows.iter().map(|r| r.sessions as i32).collect())),
-                ("events", pq::Col::I32(rows.iter().map(|r| r.events as i32).collect())),
-                ("revenue_cents", pq::Col::I64(rows.iter().map(|r| r.revenue).collect())),
-                ("top_category", pq::Col::Str(rows.iter().map(|r| if r.top == NO_TOP { None } else { Some(cat_name(r.top)) }).collect(), true)),
+                ("user_id", pq::Col::Fill(pq::Kind::Str(false), n, &uid)),
+                ("day", pq::Col::Fill(pq::Kind::Date, n, &day)),
+                ("sessions", pq::Col::Fill(pq::Kind::I32, n, &ses)),
+                ("events", pq::Col::Fill(pq::Kind::I32, n, &evn)),
+                ("revenue_cents", pq::Col::Fill(pq::Kind::I64, n, &rev)),
+                ("top_category", pq::Col::Fill(pq::Kind::Str(true), n, &top)),
             ],
         )
         .expect("write user_daily");

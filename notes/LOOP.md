@@ -330,3 +330,22 @@ PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried 
 - Hash upper bound (h12_over -> trivial values in the batch tail): p20m 59.8 -> 53.0, n20 65.8 -> 55.8 ns/line, but flawed
   (trivial hashes put every record in one shard). wyhash-style 16 B per multiply + parallel finish multiplies: exact (all
   20M outputs identical, gate, seeds 249 512 513) but p20m 58.7 -> 60.3, n20 66.2 -> 65.6: no gain (OoO already hides the chain). Reverted.
+
+## Nov 22 ~05:00 UTC: stage-by-stage (user: work strictly on stages 2-7, each alone; no combined test until all are done)
+- S2 sessionize (v62 n60: 0.73-0.78 s / 2.9-3.0 core-s):
+  single coarse radix pass (ts>>20) + insertion fix: 0.755 -> 2.128 s (whales/shared devices go quadratic). no.
+  two 10-bit passes (ts>>11) instead of 11-bit (ts>>9): 0.782 vs 0.780. tie.
+  rdtsc split of the person loop: sort fixups+click prep ~2.27 G, session loop ~4.6 G, last row ~0.4 G ticks.
+  session boundaries/purchases as bit masks (no per-event branch): 0.766 -> 0.804. no.
+  Sessionize stays as v62.
+- S3 resolve: prefetch the FlatTab slot 8 records ahead (events and clicks): resolve+pm 0.480/1.75 -> 0.456/1.65 (-5%).
+- S4 clicks: ts of 8 clicks at once through ts8 (gathered; copy path near chunk end): u+clicks 0.464/1.81 -> 0.442/1.72 (-5%).
+- S5 key partition: DKey 24 -> 20 B (32-bit loc, user shard recovered from the payload): key part -14..-17% but dedup +15..+27%
+  (loser payload reads, misaligned keys), deferred loser fix-up did not recover it: tie, dropped (scratchpad s5_dkey20.patch).
+  Write-combining bursts >= 768 B instead of 384 (all partitions): key part 0.256/1.01 -> 0.234/0.91 and 0.250/0.99 -> 0.232/0.91 (-8%),
+  u+clicks -3%, others flat; 192 B worse (key part +23%). kept 768.
+- S6 dedup: u32 table slots (8-bit tag + 24-bit index; tag matches checked against the key): 0.226/0.89 -> 0.212/0.83 and 0.215/0.84 -> 0.210/0.81 (-4%).
+- S7 write: rows cut into ncpu equal groups (was one group per sessionize thread: 0.23M-1.0M rows) and pages filled straight
+  from the rows into one reused buffer (pq Col::Fill; no per-column value vectors): 0.161/0.54 -> 0.138/0.50 (-14%).
+- COMBINED v63 (after all stages, per the user's rule): exact (SELFTEST, gate, seeds 256 257 9202 517 518, v5 dev, full 20M outputs = v62).
+  stimer 12 rounds vs v62: v5 n60 -1.7% (5/12), v5 n20 -6.3% (8/12, 7/12 >3%); cpuab 8 rounds n60: cpu 14.54 -> 14.24 (-2.1%), wall -2.7%.

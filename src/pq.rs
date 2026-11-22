@@ -11,6 +11,59 @@ pub enum Col<'a> {
     I64(Vec<i64>),
     /// plain INT32 (the rules accept any integer width)
     I32(Vec<i32>),
+    /// a column of `n` values whose data page body is written by the closure into a buffer
+    /// reused across columns (see str_page / fixed_page): no per-column value vectors
+    Fill(Kind, usize, &'a (dyn Fn(&mut Vec<u8>) + Sync)),
+}
+
+/// Physical/logical kind of a Fill column.
+#[derive(Clone, Copy)]
+pub enum Kind {
+    Str(bool /* optional */),
+    Date,
+    I64,
+    I32,
+}
+
+/// Body of a PLAIN BYTE_ARRAY page: definition levels (optional columns) then the values.
+pub fn str_page<'b>(page: &mut Vec<u8>, n: usize, get: impl Fn(usize) -> Option<&'b [u8]>, optional: bool) {
+    if optional {
+        // RLE runs of the definition levels, prefixed by their byte length
+        let at = page.len();
+        page.extend_from_slice(&[0u8; 4]);
+        let mut i = 0;
+        while i < n {
+            let v = get(i).is_some();
+            let mut j = i + 1;
+            while j < n && get(j).is_some() == v {
+                j += 1;
+            }
+            let mut h = ((j - i) as u64) << 1;
+            while h >= 0x80 {
+                page.push((h as u8) | 0x80);
+                h >>= 7;
+            }
+            page.push(h as u8);
+            page.push(v as u8);
+            i = j;
+        }
+        let len = (page.len() - at - 4) as u32;
+        page[at..at + 4].copy_from_slice(&len.to_le_bytes());
+    }
+    for i in 0..n {
+        if let Some(s) = get(i) {
+            page.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            page.extend_from_slice(s);
+        }
+    }
+}
+
+/// Body of a PLAIN fixed-width page (little-endian values).
+pub fn fixed_page<const W: usize>(page: &mut Vec<u8>, n: usize, get: impl Fn(usize) -> [u8; W]) {
+    page.reserve(n * W);
+    for i in 0..n {
+        page.extend_from_slice(&get(i));
+    }
 }
 
 // ---- Thrift compact protocol
@@ -109,15 +162,25 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
         Col::Date(v) => v.len(),
         Col::I64(v) => v.len(),
         Col::I32(v) => v.len(),
+        Col::Fill(_, n, _) => *n,
     };
     let mut f = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
     f.write_all(b"PAR1")?;
     let mut off: i64 = 4;
     let mut metas: Vec<(i64, i64, i32 /*type*/)> = vec![]; // (page offset, chunk size, type)
+    let mut page: Vec<u8> = Vec::new();
     for (_, col) in cols {
-        let mut page = Vec::new();
+        page.clear();
         let ty;
         match col {
+            Col::Fill(k, _, f) => {
+                ty = match k {
+                    Kind::Str(_) => 6,
+                    Kind::Date | Kind::I32 => 1,
+                    Kind::I64 => 2,
+                };
+                f(&mut page);
+            }
             Col::Str(v, optional) => {
                 ty = 6; // BYTE_ARRAY
                 if *optional {
@@ -182,26 +245,29 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
             Col::Date(_) => (1, false),
             Col::I64(_) => (2, false),
             Col::I32(_) => (1, false),
+            Col::Fill(Kind::Str(o), ..) => (6, *o),
+            Col::Fill(Kind::Date | Kind::I32, ..) => (1, false),
+            Col::Fill(Kind::I64, ..) => (2, false),
         };
         m.i32(1, ty);
         m.i32(3, if opt { 1 } else { 0 });
         m.bin(4, name.as_bytes());
         match col {
-            Col::Str(..) => {
+            Col::Str(..) | Col::Fill(Kind::Str(_), ..) => {
                 m.i32(6, 0); // converted UTF8
                 m.begin(10); // LogicalType
                 m.begin(1); // STRING
                 m.end();
                 m.end();
             }
-            Col::Date(_) => {
+            Col::Date(_) | Col::Fill(Kind::Date, ..) => {
                 m.i32(6, 6); // converted DATE
                 m.begin(10);
                 m.begin(6); // DATE
                 m.end();
                 m.end();
             }
-            Col::I64(_) | Col::I32(_) => {}
+            _ => {}
         }
         m.end();
     }
