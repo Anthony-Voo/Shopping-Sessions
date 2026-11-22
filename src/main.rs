@@ -2174,6 +2174,80 @@ fn sorted_by_pk_ts<T: Copy>(v: &[T], base: i64, pk: impl Fn(&T) -> u64, ts: impl
     k.iter().map(|&x| v[x as u32 as usize]).collect()
 }
 
+/// Open-addressing map from a non-zero, already uniform 64-bit hash to (u32, u32): linear probing
+/// over flat arrays, slot from a multiply of the key (the top bits pick the shard, so they are
+/// equal within one), 0 = empty. Grows at 50% load. Used for the per-shard user tables.
+struct FlatTab {
+    keys: Vec<u64>,
+    vals: Vec<(u32, u32)>,
+    mask: usize,
+    shift: u32,
+    len: usize,
+}
+
+impl FlatTab {
+    fn new() -> Self {
+        FlatTab { keys: Vec::new(), vals: Vec::new(), mask: 0, shift: 63, len: 0 }
+    }
+    /// Empty the table with room for `want` keys at <= 50% load (keeps the allocation if it fits).
+    fn reset(&mut self, want: usize) {
+        let cap = (want * 2).max(1024).next_power_of_two();
+        if self.keys.len() < cap {
+            self.keys = vec![0; cap];
+            self.vals = vec![(0, 0); cap];
+        } else {
+            let cap = self.keys.len();
+            self.keys[..cap].fill(0);
+        }
+        let cap = self.keys.len();
+        self.mask = cap - 1;
+        self.shift = 64 - cap.trailing_zeros();
+        self.len = 0;
+    }
+    /// Slot holding `k` (found) or the empty slot where it would go.
+    #[inline(always)]
+    fn probe(&self, k: u64) -> (usize, bool) {
+        let mut i = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize;
+        loop {
+            // SAFETY: i <= mask < keys.len()
+            let t = unsafe { *self.keys.get_unchecked(i) };
+            if t == k {
+                return (i, true);
+            }
+            if t == 0 {
+                return (i, false);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    /// Store (k, v) in the empty slot i returned by probe(k).
+    #[inline(always)]
+    fn put(&mut self, i: usize, k: u64, v: (u32, u32)) {
+        self.keys[i] = k;
+        self.vals[i] = v;
+        self.len += 1;
+        if self.len * 2 > self.keys.len() {
+            self.grow();
+        }
+    }
+    #[cold]
+    fn grow(&mut self) {
+        let (ok, ov) = (std::mem::take(&mut self.keys), std::mem::take(&mut self.vals));
+        let cap = ok.len() * 2;
+        self.keys = vec![0; cap];
+        self.vals = vec![(0, 0); cap];
+        self.mask = cap - 1;
+        self.shift = 64 - cap.trailing_zeros();
+        for (k, v) in ok.into_iter().zip(ov) {
+            if k != 0 {
+                let (i, _) = self.probe(k);
+                self.keys[i] = k;
+                self.vals[i] = v;
+            }
+        }
+    }
+}
+
 struct SendPtr<T>(*mut T);
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
@@ -3206,7 +3280,15 @@ last,b,c,d,e,f,g"#
             const LO: u64 = (1 << 24) - 1;
             tab.clear();
             tab.resize(cap, 0);
+            const AHEAD: usize = 8;
             for (i, k) in ks.iter().enumerate() {
+                // the table outgrows L2 at large sizes: fetch the slot of the key AHEAD places on
+                #[cfg(target_feature = "sse")]
+                if let Some(f) = ks.get(i + AHEAD) {
+                    let fs = (f.eh.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & mask;
+                    // SAFETY: fs <= mask < tab.len(); prefetch has no architectural effect
+                    unsafe { std::arch::x86_64::_mm_prefetch(tab.as_ptr().add(fs) as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+                }
                 let hi = k.eh & !LO;
                 let mut slot = (k.eh.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & mask;
                 loop {
@@ -3257,16 +3339,23 @@ last,b,c,d,e,f,g"#
         .map(|(cci, &c)| {
             let mut sh: Vec<UCl> = Vec::with_capacity(c.len() / 40 + 16);
             let cbase = c.as_ptr() as usize;
+            let cend = cbase + c.len();
             let mut cc = vec![0u32; NSH];
             let mut mc = MonthCache::new();
             scan_lines3::<4>(c, |r| {
                 let Some([Some(cid), Some(uid), Some(camp), ts]) = r else { return };
                 let Some(&camp) = campaigns.get(camp) else { return };
-                let ts = mc.f1(ts); // ISO ...Z via the month cache; any other form -> parse_ts
+                // 13-digit epoch ms through the SWAR path (reads only the field's own bytes); ISO ...Z
+                // via the month cache; any other form -> parse_ts (identical results either way)
+                let ts = match ts {
+                    Some(t) if t.len() == 13 => parse_ts_over(ts),
+                    _ => mc.f1(ts),
+                };
                 if ts == BAD || ts < ws - WEEK || ts >= we {
                     return;
                 }
-                let (uh, uh2) = h12(uid);
+                // one 8-byte load for the id's tail when 8 more bytes of the chunk follow it
+                let (uh, uh2) = if uid.as_ptr() as usize + uid.len() + 8 <= cend { h12_over(uid) } else { h12(uid) };
                 cc[shard_h(uh)] += 1;
                 let cr = |f: B| ((cci as u32) << CREF_OFF_BITS) | (f.as_ptr() as usize - cbase) as u32;
                 sh.push(UCl { uh, uref: cr(uid), cref: cr(cid), uh2: uh2 as u32, ts: (ts - (ws - WEEK)) as u32, camp });
@@ -3297,17 +3386,22 @@ last,b,c,d,e,f,g"#
     let resolved: Vec<(Vec<B>, Vec<u32>, Vec<u32>)> = jobs
         .into_par_iter()
         .map_init(
-            || (FxHashMap::<u64, (u64, u32)>::default(), FxHashMap::<(u64, u64), u32>::default()),
+            || (FlatTab::new(), FxHashMap::<(u64, u64), u32>::default()),
             |(tab, side), (shi, (prs_out, crs_out))| {
             let lkm = &lks[shi];
             // uid h64 -> (uid h2, pid), pre-filled with the shard's linked users and extended
             // with unlinked ones as they appear (one lookup per record); reused across shards
-            tab.clear();
-            side.clear(); // 64-bit hash clashes
+            side.clear(); // 64-bit hash clashes, and the (never seen in practice) hash value 0
+            tab.reset(if lk_clash { 0 } else { lkm.len() * 2 + 1024 });
             if !lk_clash {
-                tab.reserve(lkm.len() * 2 + 1024);
-                for &(k, v) in lkm.iter() {
-                    tab.insert(k, v);
+                for &(k, (t2, root)) in lkm.iter() {
+                    if k == 0 {
+                        side.insert((0, t2 as u32 as u64), root);
+                        continue;
+                    }
+                    let (i, found) = tab.probe(k);
+                    debug_assert!(!found, "linked users have distinct 64-bit hashes");
+                    tab.put(i, k, (t2 as u32, root));
                 }
             }
             let mut unl_names: Vec<B> = Vec::new();
@@ -3331,25 +3425,32 @@ last,b,c,d,e,f,g"#
                     side.insert((uh, u2), p);
                     return p;
                 }
-                match tab.entry(uh) {
-                    std::collections::hash_map::Entry::Occupied(o) => {
-                        let (t2, p) = *o.get();
-                        if t2 as u32 as u64 == u2 {
-                            return p;
-                        }
-                        // same 64-bit hash, different user: exact side table
-                        if let Some(&p) = side.get(&(uh, u2)) {
-                            return p;
-                        }
-                        let p = new_unlinked(name_of_ref(u), &mut unl_names);
-                        side.insert((uh, u2), p);
-                        p
+                if uh == 0 {
+                    // 0 marks an empty slot in the flat table: this user lives in the side table
+                    if let Some(&p) = side.get(&(0, u2)) {
+                        return p;
                     }
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        let p = new_unlinked(name_of_ref(u), &mut unl_names);
-                        v.insert((u2, p));
-                        p
+                    let p = new_unlinked(name_of_ref(u), &mut unl_names);
+                    side.insert((0, u2), p);
+                    return p;
+                }
+                let (i, found) = tab.probe(uh);
+                if found {
+                    let (t2, p) = tab.vals[i];
+                    if t2 as u64 == u2 {
+                        return p;
                     }
+                    // same 64-bit hash, different user: exact side table
+                    if let Some(&p) = side.get(&(uh, u2)) {
+                        return p;
+                    }
+                    let p = new_unlinked(name_of_ref(u), &mut unl_names);
+                    side.insert((uh, u2), p);
+                    p
+                } else {
+                    let p = new_unlinked(name_of_ref(u), &mut unl_names);
+                    tab.put(i, uh, (u2 as u32, p));
+                    p
                 }
             };
             let evs = &uev_all[uev_off[shi]..uev_off[shi + 1]];

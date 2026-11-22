@@ -302,3 +302,12 @@ PARSER STATUS: ~62-66 ns/line single-thread, flat profile (no item > 6%). Tried 
   p20m -0.5% (5/12); v5 n20 (single month) +1.9% (7/12 faster); v5 n60 (single month) -0.0% (4/12). Win where it applies, tie elsewhere.
 - PGO profile retrained on v5 data: n60 +1.5% vs v60 (0/12 >3%): not adopted (v60 keeps the profile made from its source on old-format data).
 - v5 data shape: lines avg 82 B (was 77), 0.49% over the 128 B fast path; v59 and v60 exact on it.
+
+## Nov 22 ~03:40 UTC: board #19 (0.9663; leader 0.5987); stage polish easiest -> hardest (v60, v5 20M: parse 0.533 s / sess 0.228 / u+clicks 0.183 / resolve+pm 0.133 / key part 0.076 / dedup 0.070 / write 0.055)
+- write: exact-size Parquet pages -> 0.051 vs 0.053 s, no effect, reverted.
+- dedup: prefetch the slot of the key 8 ahead (table > L2 at 60M): dedup 0.234 -> 0.219 s, cpu 0.92 -> 0.86 (n60, 4 runs). kept.
+- resolve: FlatTab (open addressing on the uniform uid h64, multiply slot, 0 = empty -> side table) instead of FxHashMap:
+  resolve+pm 0.488 -> 0.472 s, cpu 1.75 -> 1.70. kept.
+- clicks: 13-digit ts through parse_ts_over (SWAR), uid hash via h12_over when 8 chunk bytes follow: click parse cpu 1.08-1.31 -> 1.02-1.09. kept.
+- v61 = v60 + those three, PGO regenerated. Gate PASS, seeds 241 242 (old gen) + 504 505 (v5 gen) MATCH, v5 dev answer MATCH.
+  stimer 12 rounds: v5 n60 +0.5% (5/12), v5 n20 +0.6% (4/12); cpuab 8 rounds n60: cpu 15.19 -> 14.93 core-s (-1.7%), wall -2.0% (4/8). Small, real in CPU, inside wall noise.
